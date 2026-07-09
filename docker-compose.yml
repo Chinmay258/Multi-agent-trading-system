@@ -1,0 +1,286 @@
+# =============================================================================
+# Trading System — Docker Compose (Development / Paper Trading)
+# =============================================================================
+# Usage:
+#   docker-compose up -d                  # start all infrastructure
+#   docker-compose up market_data_agent   # start a specific agent
+#   docker-compose logs -f decision_agent # tail logs
+#   docker-compose down -v                # stop + remove volumes (clean slate)
+#
+# All agents share the same network and resolve each other by service name.
+# Secrets and overrides go in .env (never committed to git).
+#
+# Production note: Use docker-compose.prod.yml for resource limits,
+# log rotation, and secrets management overrides.
+# =============================================================================
+
+x-agent-defaults: &agent-defaults
+  build:
+    context: .
+    dockerfile: infrastructure/Dockerfile.agent
+  env_file: .env
+  networks:
+    - trading-net
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
+  volumes:
+    - ./models:/app/models
+  # Default healthcheck for every agent: each agent process starts a Prometheus
+  # metrics server on 9090 (core/metrics.py), so a 200 on /metrics proves both
+  # the metrics endpoint and the asyncio loop are alive. Agents that expose a
+  # more meaningful endpoint (monitoring) override this below.
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9090/metrics', timeout=2)"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 40s
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Infrastructure: PostgreSQL + TimescaleDB
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    container_name: trading_postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-trading_db}
+      POSTGRES_USER: ${DB_USER:-trading_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-trading_pass}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    networks:
+      - trading-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-trading_user} -d ${DB_NAME:-trading_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Infrastructure: Redis (pub/sub + cache)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: trading_redis
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1
+      --appendonly yes
+      --appendfsync everysec
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    networks:
+      - trading-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Agents
+  # ---------------------------------------------------------------------------
+
+  market_data_agent:
+    <<: *agent-defaults
+    container_name: trading_market_data
+    command: python -m agents.market_data.agent
+    environment:
+      AGENT_NAME: market_data_agent
+    # Publish the Prometheus scrape endpoint of one representative agent
+    # so a developer can curl it from the host. In a real cluster every
+    # container would be scraped internally over the Docker network.
+    ports:
+      - "9090:9090"
+    healthcheck:
+      # market_data does not expose 8001 — use the metrics port instead,
+      # which proves both the metrics server and the asyncio loop are alive.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9090/metrics', timeout=2)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  technical_analysis_agent:
+    <<: *agent-defaults
+    container_name: trading_technical_analysis
+    command: python -m agents.technical_analysis.agent
+    environment:
+      AGENT_NAME: technical_analysis_agent
+    depends_on:
+      - market_data_agent
+
+  sentiment_agent:
+    <<: *agent-defaults
+    container_name: trading_sentiment
+    command: python -m agents.sentiment.agent
+    environment:
+      AGENT_NAME: sentiment_agent
+    profiles:
+      - sentiment   # Only started with: docker-compose --profile sentiment up
+
+  decision_agent:
+    <<: *agent-defaults
+    container_name: trading_decision
+    command: python -m agents.decision.agent
+    environment:
+      AGENT_NAME: decision_agent
+    depends_on:
+      - technical_analysis_agent
+
+  risk_agent:
+    <<: *agent-defaults
+    container_name: trading_risk
+    command: python -m agents.risk.agent
+    environment:
+      AGENT_NAME: risk_agent
+    depends_on:
+      - decision_agent
+
+  execution_agent:
+    <<: *agent-defaults
+    container_name: trading_execution
+    command: python -m agents.execution.agent
+    environment:
+      AGENT_NAME: execution_agent
+    ports:
+      - "${MT5_LISTEN_PORT:-5556}:5556"   # MT5 WebRequest polling endpoint
+    depends_on:
+      - risk_agent
+
+  monitoring_agent:
+    <<: *agent-defaults
+    container_name: trading_monitoring
+    command: python -m agents.monitoring.agent
+    environment:
+      AGENT_NAME: monitoring_agent
+    # Publish the aiohttp /health and /agents endpoints so the host-side
+    # healthcheck script and Docker HEALTHCHECK can reach them directly.
+    ports:
+      - "8081:8081"
+    # Monitoring starts first, depends only on infra
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Control Plane API
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: infrastructure/Dockerfile.agent
+    container_name: trading_api
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file: .env
+    ports:
+      - "${API_PORT:-8000}:8000"
+    networks:
+      - trading-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - .:/app   # Hot-reload in development
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Dashboard (React + Vite, served by nginx; proxies /api + /ws to the API)
+  # ---------------------------------------------------------------------------
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: trading_dashboard
+    ports:
+      - "3000:80"
+    networks:
+      - trading-net
+    depends_on:
+      - api
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Observability (optional — start with: docker-compose --profile monitoring up)
+  # ---------------------------------------------------------------------------
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: trading_prometheus
+    volumes:
+      - ./infrastructure/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      # Host 9091 → container 9090 to avoid clashing with market_data_agent,
+      # which publishes its own metrics endpoint on host 9090.
+      - "9091:9090"
+    networks:
+      - trading-net
+    profiles:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: trading_grafana
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - trading-net
+    profiles:
+      - monitoring
+
+# =============================================================================
+# Networks & Volumes
+# =============================================================================
+networks:
+  trading-net:
+    driver: bridge
+    name: trading_network
+
+volumes:
+  postgres_data:
+    name: trading_postgres_data
+  redis_data:
+    name: trading_redis_data
+  grafana_data:
+    name: trading_grafana_data

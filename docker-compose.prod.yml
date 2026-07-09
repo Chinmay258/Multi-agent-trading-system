@@ -1,0 +1,98 @@
+# =============================================================================
+# Production overlay — adds Caddy (automatic HTTPS) and hardens the stack.
+# =============================================================================
+# Use together with the base file:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# What it changes vs. the base dev stack:
+#   - Adds a Caddy reverse proxy terminating TLS on :80/:443 in front of the
+#     dashboard (which itself proxies /api + /ws to the API).
+#   - Removes the dev debug host-port mappings (3000, 8000, 8081, 9090, 5556):
+#     only 22/80/443 should ever be open on the VM (enforced by the cloud
+#     firewall too — see infra/). The agents talk over the internal network.
+#   - Adds conservative memory limits so a small VM doesn't OOM.
+#
+# Keyless + paper by design: no secrets are required to run this.
+# =============================================================================
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: trading_caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    volumes:
+      - ./infra/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - trading-net
+    depends_on:
+      - dashboard
+
+  # Front door is Caddy now — drop the public debug port and cap memory.
+  dashboard:
+    ports: !reset []
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  api:
+    ports: !reset []
+    # Production: no --reload (immutable image code), no dev source bind-mount.
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 1
+    volumes: !reset []
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
+  market_data_agent:
+    ports: !reset []
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
+  monitoring_agent:
+    ports: !reset []
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  execution_agent:
+    ports: !reset []
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  technical_analysis_agent:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  decision_agent:
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  risk_agent:
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  caddy_data:
+    name: trading_caddy_data
+  caddy_config:
+    name: trading_caddy_config

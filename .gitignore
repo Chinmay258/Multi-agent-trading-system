@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor
+.vscode/
+.idea/
+
+# Local environment
+.env
+
+# Trained ML models (binary artefacts; do not commit)
+models/
+
+# Backtest: transient fetched-data cache (the committed sample lives in data/sample/).
+# Note: backtest/results/ IS committed (the evaluation report + metrics are deliverables).
+data/cache/
+
+# Terraform — never commit state (may contain secrets) or local vars/plugins.
+infra/terraform/.terraform/
+infra/terraform/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+terraform.tfvars
+*.auto.tfvars
+
+# Node / dashboard build artifacts
+dashboard/node_modules/
+dashboard/dist/
+dashboard/test-results/
+dashboard/playwright-report/
+
+# OS
+.DS_Store
+Thumbs.db

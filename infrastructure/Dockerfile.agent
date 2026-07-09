@@ -1,0 +1,123 @@
+# =============================================================================
+# Dockerfile.agent — shared image for all trading agents and the API
+# =============================================================================
+# Multi-stage build:
+#   Stage 1 (builder): install dependencies in a venv
+#   Stage 2 (runtime): copy only the venv + source, no build tools
+#
+# This keeps the runtime image lean and avoids shipping gcc, pip caches, etc.
+# All agents use this same image with different CMD overrides in docker-compose.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: dependency builder
+# ---------------------------------------------------------------------------
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+# System dependencies for TA-Lib and asyncpg compilation.
+# Note: libta-lib-dev is NOT installed from apt — Debian trixie dropped it.
+# The TA-Lib C library is built from source in the next layer instead.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    make \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install TA-Lib C library from the official GitHub release.
+# The legacy SourceForge tarball (0.4.0) no longer compiles on modern GCC;
+# 0.6.x is the current upstream branch and builds cleanly.
+RUN curl -fsSL -o /tmp/ta-lib.tar.gz \
+        https://github.com/TA-Lib/ta-lib/releases/download/v0.6.4/ta-lib-0.6.4-src.tar.gz \
+    && tar -xzf /tmp/ta-lib.tar.gz -C /tmp \
+    && cd /tmp/ta-lib-0.6.4 \
+    && ./configure --prefix=/usr \
+    && make -j"$(nproc)" \
+    && make install \
+    && cd / && rm -rf /tmp/ta-lib.tar.gz /tmp/ta-lib-0.6.4 \
+    && ldconfig
+
+# Python dependencies in isolated venv
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY pyproject.toml ./
+# TODO: replace with: RUN pip install --no-cache-dir -e .
+# For now install requirements directly
+RUN pip install --no-cache-dir \
+    # Core async framework
+    fastapi==0.115.0 \
+    uvicorn[standard]==0.30.6 \
+    # Settings and validation
+    pydantic==2.9.2 \
+    pydantic-settings==2.5.2 \
+    # Database
+    sqlalchemy[asyncio]==2.0.36 \
+    asyncpg==0.29.0 \
+    psycopg2-binary==2.9.9 \
+    alembic==1.13.3 \
+    # Redis
+    redis[hiredis]==5.1.1 \
+    # Exchange connectivity
+    ccxt==4.3.89 \
+    # Market data processing
+    pandas==2.2.3 \
+    numpy==1.26.4 \
+    # TA-Lib Python wrapper >=0.6.0 links against the 0.6.x C library
+    # we install in the layer above.
+    TA-Lib==0.6.4 \
+    # Logging
+    structlog==24.4.0 \
+    # Utilities
+    python-dotenv==1.0.1 \
+    httpx==0.27.2 \
+    aiohttp==3.10.10 \
+    tenacity==9.0.0 \
+    # Phase 6: metrics are first-class.
+    prometheus-client==0.21.1 \
+    # Phase 8: ML signal engine
+    xgboost>=2.0.0 \
+    scikit-learn>=1.4.0 \
+    joblib>=1.3.0
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime
+# ---------------------------------------------------------------------------
+FROM python:3.11-slim AS runtime
+
+WORKDIR /app
+
+# Runtime-only system libraries.
+# libta-lib0 also isn't in trixie; the actual shared object is copied from
+# the builder stage below (COPY --from=builder /usr/lib/libta_lib*).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root user for security
+RUN groupadd -r trading && useradd -r -g trading trading
+
+# Copy venv from builder
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /usr/lib/libta_lib* /usr/lib/
+ENV PATH="/opt/venv/bin:$PATH"
+ENV PYTHONPATH="/app"
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Copy source code
+COPY --chown=trading:trading . .
+
+USER trading
+
+# Health check endpoint (each agent exposes one on its own port)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD python -c "import sys; sys.exit(0)"  # Override per-agent in docker-compose
+
+# Default command — overridden per-service in docker-compose.yml
+CMD ["python", "-m", "agents.market_data.agent"]

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\death\\\\Downloads\\\\files-phase2\\\\trading_system_phase2\\\\trading_system\\\\\" -Recurse -Directory | Select-Object FullName)",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\death\\\\Downloads\\\\files-phase2\\\\trading_system_phase2\\\\trading_system\" -Recurse -Directory)",
+      "Bash(Select-Object FullName)",
+      "Bash(python -m pytest tests/unit/test_repositories.py -v -p no:cacheprovider --override-ini=\"addopts=\")"
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+# Caddy reverse proxy — automatic HTTPS (Let's Encrypt) in front of the stack.
+#
+# The dashboard container (nginx) already serves the SPA AND proxies /api + /ws to
+# the api service, so Caddy only needs to terminate TLS and forward everything to it.
+#
+# DOMAIN is injected from the environment (see docker-compose.prod.yml):
+#   - A real domain (e.g. demo.example.com)  -> Caddy fetches a free Let's Encrypt cert.
+#   - A free wildcard-DNS host (e.g. 203.0.113.10.sslip.io) -> also gets a real cert,
+#     so you get HTTPS with no domain purchase.
+#   - "localhost" (local testing)            -> Caddy uses its built-in local CA.
+#
+# Caddy persists certs in the caddy_data volume, so renewals survive restarts.
+
+{$DOMAIN:localhost} {
+	encode zstd gzip
+	reverse_proxy dashboard:80
+}

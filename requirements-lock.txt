@@ -1,0 +1,76 @@
+# =============================================================================
+# requirements-lock.txt — EXACT, fully-resolved runtime dependency set.
+# =============================================================================
+# Captured via `pip freeze` from the verified-working Docker runtime image
+# (infrastructure/Dockerfile.agent). This is the reproducibility ground truth:
+#   pip install -r requirements-lock.txt
+# reproduces the exact environment the system was tested against. The pinned
+# top-level deps in pyproject.toml are a subset of these (transitive deps
+# included here). Regenerate with: docker exec <agent_container> pip freeze.
+# Note: TA-Lib (the Python wrapper) needs the TA-Lib C library installed first.
+# =============================================================================
+aiodns==4.0.4
+aiohappyeyeballs==2.6.2
+aiohttp==3.10.10
+aiosignal==1.4.0
+alembic==1.13.3
+annotated-types==0.7.0
+anyio==4.13.0
+async-timeout==5.0.1
+asyncpg==0.29.0
+attrs==26.1.0
+ccxt==4.3.89
+certifi==2026.5.20
+cffi==2.0.0
+charset-normalizer==3.4.7
+click==8.4.1
+cryptography==48.0.0
+fastapi==0.115.0
+frozenlist==1.8.0
+greenlet==3.5.1
+h11==0.16.0
+hiredis==3.3.1
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.27.2
+idna==3.17
+joblib==1.5.3
+Mako==1.3.12
+MarkupSafe==3.0.3
+multidict==6.7.1
+numpy==1.26.4
+nvidia-nccl-cu12==2.30.4
+pandas==2.2.3
+prometheus_client==0.21.1
+propcache==0.5.2
+psycopg2-binary==2.9.9
+pycares==5.0.1
+pycparser==3.0
+pydantic==2.9.2
+pydantic-settings==2.5.2
+pydantic_core==2.23.4
+python-dateutil==2.9.0.post0
+python-dotenv==1.0.1
+pytz==2026.2
+PyYAML==6.0.3
+redis==5.1.1
+requests==2.34.2
+scikit-learn==1.8.0
+scipy==1.17.1
+six==1.17.0
+sniffio==1.3.1
+SQLAlchemy==2.0.36
+starlette==0.38.6
+structlog==24.4.0
+ta-lib==0.6.4
+tenacity==9.0.0
+threadpoolctl==3.6.0
+typing_extensions==4.15.0
+tzdata==2026.2
+urllib3==2.7.0
+uvicorn==0.30.6
+uvloop==0.22.1
+watchfiles==1.2.0
+websockets==16.0
+xgboost==3.2.0
+yarl==1.24.2

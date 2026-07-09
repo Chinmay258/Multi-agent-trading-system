@@ -1,0 +1,41 @@
+# Keep the build context (and resulting image) lean and secret-free.
+# The Dockerfile does `COPY . .`, so anything not excluded here lands in the image.
+
+# Secrets / local env — NEVER bake into an image
+.env
+.env.*
+!.env.example
+
+# Version control & CI
+.git
+.github
+.gitignore
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Tooling caches
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Tests and bundled sample data are not needed at runtime (live mode uses the
+# public feed). Excluded to shrink the image; CI runs tests from the checkout.
+tests/
+data/
+
+# Docs / editor
+docs/
+*.md
+.vscode/
+.idea/
+.DS_Store

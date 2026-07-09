@@ -1,0 +1,190 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs on the same branch when a newer push lands.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Note: TA-Lib is intentionally NOT installed in CI. The indicators fall back to
+# NumPy implementations when the TA-Lib C library is absent (see
+# agents/technical_analysis/indicators.py: TALIB_AVAILABLE), which keeps CI fast
+# and reliable. The Docker image (built in the `docker-build` job) installs the
+# real TA-Lib C library from source.
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Lint — ruff check + format check. Cheap, fail-fast.
+  # --------------------------------------------------------------------------
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install "ruff==0.15.14"
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+
+  # --------------------------------------------------------------------------
+  # Secret scan — gitleaks. Fails the build if a credential is committed.
+  # --------------------------------------------------------------------------
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # --------------------------------------------------------------------------
+  # Type check — mypy against core/ and agents/.
+  # --------------------------------------------------------------------------
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    # Advisory: strict mypy findings are reported but do not block the pipeline.
+    # Tighten to blocking once the codebase is fully strict-clean.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install project (dev extras)
+        run: pip install -e ".[dev]"
+      - name: mypy
+        run: mypy core/ agents/ data_sources/ --ignore-missing-imports
+
+  # --------------------------------------------------------------------------
+  # Unit tests — Python 3.11 and 3.12, no I/O required (NumPy indicator fallback).
+  # --------------------------------------------------------------------------
+  unit-tests:
+    name: Unit tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install project (dev extras)
+        run: pip install -e ".[dev]"
+      - name: pytest unit
+        run: |
+          pytest tests/unit/ -q \
+            --cov=core --cov=agents --cov=data_sources \
+            --cov-report=term-missing \
+            --cov-fail-under=50
+
+  # --------------------------------------------------------------------------
+  # Integration + E2E tests — real Redis + Postgres services. Includes the
+  # keyless end-to-end pipeline test (candle → ... → recorded paper trade).
+  # --------------------------------------------------------------------------
+  integration-tests:
+    name: Integration + E2E tests
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 5
+      postgres:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_USER: trading_user
+          POSTGRES_PASSWORD: trading_pass
+          POSTGRES_DB: trading_db
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U trading_user -d trading_db"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+
+    env:
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
+      DB_HOST: localhost
+      DB_PORT: "5432"
+      DB_NAME: trading_db
+      DB_USER: trading_user
+      DB_PASSWORD: trading_pass
+      TRADING_MODE: paper
+      DATA_SOURCE: public
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install project (dev extras)
+        run: pip install -e ".[dev]"
+      - name: pytest integration + e2e
+        run: pytest tests/integration/ -q --no-cov -m "not requires_exchange"
+
+  # --------------------------------------------------------------------------
+  # Docker build — proves the image (with real TA-Lib) still builds. No push.
+  # --------------------------------------------------------------------------
+  docker-build:
+    name: Docker image build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build agent image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infrastructure/Dockerfile.agent
+          push: false
+          tags: trading-system:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # --------------------------------------------------------------------------
+  # Dashboard — build the Vite SPA and run Playwright smoke tests. The smoke
+  # test serves the built bundle via `npm run preview` (no API needed; the app
+  # renders graceful loading states), proving the pages render and the build is
+  # healthy.
+  # --------------------------------------------------------------------------
+  dashboard:
+    name: Dashboard build + smoke
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e

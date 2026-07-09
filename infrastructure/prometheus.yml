@@ -1,0 +1,29 @@
+# =============================================================================
+# Prometheus scrape configuration (optional — `docker compose --profile monitoring up`)
+# =============================================================================
+# Each agent exposes a Prometheus metrics endpoint (see core/metrics.py). On the
+# Docker network the agents are reachable by their service name. The metrics
+# server inside every agent binds the port configured by MONITORING_PROMETHEUS_PORT
+# (default 9090).
+#
+# This file was missing from the repo while docker-compose mounted it; without it
+# the prometheus service fails to start. It is referenced only by the optional
+# `monitoring` profile, so the core paper-trading stack does not depend on it.
+# =============================================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: trading_agents
+    static_configs:
+      - targets:
+          - market_data_agent:9090
+          - technical_analysis_agent:9090
+          - decision_agent:9090
+          - risk_agent:9090
+          - execution_agent:9090
+          - monitoring_agent:9090
+        labels:
+          system: trading_system

@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored (never commit it).
+#
+# Prerequisite: run `oci setup config` once to create ~/.oci/config (free, 2 min).
+
+region           = "ap-mumbai-1"                     # your OCI home region
+compartment_ocid = "ocid1.tenancy.oc1..xxxxxxxx"     # tenancy OCID = your root compartment
+ssh_public_key   = "ssh-ed25519 AAAA... you@host"    # contents of ~/.ssh/id_ed25519.pub
+
+# HTTPS hostname. Easiest: leave as a placeholder, apply once, then set this to
+# "<the-output-public-ip>.sslip.io" and re-apply (real cert, no domain to buy).
+domain = "CHANGEME.sslip.io"
+
+# Optional — defaults are Always-Free-safe (2 OCPU / 12 GB of the 4 / 24 budget).
+# instance_ocpus     = 2
+# instance_memory_gb = 12
+# repo_url           = "https://github.com/Chinmay258/Multi-agent-trading-system.git"
+# branch             = "main"

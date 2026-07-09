@@ -1,0 +1,172 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-system"
+version = "0.1.0"
+description = "Modular autonomous multi-agent AI trading system"
+requires-python = ">=3.11"
+
+# -----------------------------------------------------------------------------
+# Dependencies are FULLY PINNED for reproducibility ("clone and run").
+# These versions are the exact set verified working in the Docker runtime image
+# (see infrastructure/Dockerfile.agent and requirements-lock.txt). Note that
+# TA-Lib is intentionally NOT here — it requires a C library that is painful to
+# install keyless, so it lives in the optional `talib` extra. Without it the
+# indicators transparently fall back to NumPy implementations
+# (see agents/technical_analysis/indicators.py: TALIB_AVAILABLE).
+# -----------------------------------------------------------------------------
+dependencies = [
+    # Web framework + async server
+    "fastapi==0.115.0",
+    "uvicorn[standard]==0.30.6",
+    # Settings and validation
+    "pydantic==2.9.2",
+    "pydantic-settings==2.5.2",
+    # Database
+    "sqlalchemy[asyncio]==2.0.36",
+    "asyncpg==0.29.0",
+    "psycopg2-binary==2.9.9",
+    "alembic==1.13.3",
+    # Redis
+    "redis[hiredis]==5.1.1",
+    # Exchange connectivity (keyless public market data)
+    "ccxt==4.3.89",
+    # Market data processing
+    "pandas==2.2.3",
+    "numpy==1.26.4",
+    "scipy==1.17.1",
+    # Structured logging
+    "structlog==24.4.0",
+    # HTTP clients
+    "httpx==0.27.2",
+    "aiohttp==3.10.10",
+    # Retry logic
+    "tenacity==9.0.0",
+    # Utilities
+    "python-dotenv==1.0.1",
+    # Metrics exporter
+    "prometheus-client==0.21.1",
+    # ML signal engine
+    "xgboost==3.2.0",
+    "scikit-learn==1.8.0",
+    "joblib==1.5.3",
+]
+
+[project.optional-dependencies]
+# Real TA-Lib (needs the TA-Lib C library installed on the host first). Optional:
+# the system runs without it via the NumPy fallback. The Docker image installs it.
+talib = ["TA-Lib==0.6.4"]
+
+dev = [
+    "pytest==9.0.3",
+    "pytest-asyncio==1.3.0",
+    "pytest-cov==7.1.0",
+    "mypy==1.13.0",
+    "ruff==0.15.14",
+    "fakeredis[aioredis]==2.35.1",
+    "aiosqlite==0.22.1",
+    # Evaluation report charts (backtest/report.py). Imported lazily; only needed
+    # to regenerate EVALUATION_REPORT.{html,pdf} via `make eval`.
+    "matplotlib==3.9.2",
+]
+
+ml = [
+    # Future: PyTorch for RL agent
+    "torch==2.4.0",
+    "gymnasium==0.29.1",
+]
+
+monitoring = [
+    # prometheus-client moved to main dependencies in Phase 6.
+    # This extra is reserved for future observability tooling
+    # (e.g. opentelemetry exporters, Grafana provisioning).
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "agents*", "api*", "data_sources*", "backtest*"]
+
+# ---------------------------------------------------------------------------
+# Ruff (linter + formatter)
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes (real bugs: unused/undefined names)
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+    "ANN", # type annotations (warns on missing)
+]
+ignore = [
+    "ANN204",  # missing return type for __init__ (we omit on dunders)
+    "ANN401",  # allow explicit Any where the boundary is genuinely dynamic (MT5, bus)
+    "B008",    # function calls in argument defaults (Pydantic Field needs this)
+    "B027",    # empty non-abstract method in ABC (intentional optional lifecycle hooks)
+    "B905",    # zip() without strict= (current behavior is intentional)
+    "C408",    # dict(a=1) vs {"a": 1} — stylistic, not worth churning working code
+    "E501",    # line length is enforced by the formatter; long strings/comments are fine
+    "E741",    # ambiguous var name 'l' (used as low/left in a few math helpers)
+    "UP042",   # str-enum: switching Enum base (str,Enum -> StrEnum) risks serialization changes
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Relax annotations/security in tests; F821 = annotation-only refs; B017 = broad raises.
+"tests/**" = ["ANN", "S", "F821", "B017"]
+
+# ---------------------------------------------------------------------------
+# MyPy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["ccxt.*", "talib.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "requires_exchange: test needs a live exchange/network (skipped in CI)",
+    "requires_redis: test needs a real Redis instance",
+]
+addopts = [
+    "--cov=core",
+    "--cov=agents",
+    "--cov-report=term-missing",
+    "--cov-fail-under=40",  # TODO: raise to 80 once all agents are built
+]
+
+# ---------------------------------------------------------------------------
+# Coverage
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+source = ["core", "agents"]
+omit = ["*/tests/*", "*/migrations/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@abstractmethod",
+]

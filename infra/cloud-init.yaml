@@ -1,0 +1,59 @@
+#cloud-config
+# =============================================================================
+# Cloud-init bootstrap — turns a fresh Ubuntu VM into the running demo.
+# =============================================================================
+# Cloud-agnostic: works on Oracle Cloud (ARM Ampere), GCP, AWS, DigitalOcean, etc.
+# Terraform fills ${domain}, ${repo_url}, ${branch} via templatefile(); to use it
+# by hand, replace those placeholders and paste it as the instance's user-data.
+#
+# It installs Docker, clones the repo, writes a keyless .env, and brings up the
+# production stack (Caddy auto-HTTPS in front of the dashboard + API). No secrets.
+# =============================================================================
+package_update: true
+package_upgrade: false
+packages:
+  - git
+  - ca-certificates
+  - curl
+  - ufw
+
+write_files:
+  - path: /etc/profile.d/app.sh
+    content: |
+      export DOMAIN="${domain}"
+
+runcmd:
+  # --- Swap: a 4 GB swapfile so image builds + runtime survive on a 1 GB micro. ---
+  - fallocate -l 4G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=4096
+  - chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+  - grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+  # --- Host firewall: only SSH + HTTP + HTTPS. Everything else stays internal. ---
+  - ufw --force reset
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow 22/tcp
+  - ufw allow 80/tcp
+  - ufw allow 443/tcp
+  - ufw --force enable
+
+  # --- Docker (Compose v2 plugin included) ---
+  - curl -fsSL https://get.docker.com | sh
+  - systemctl enable --now docker
+  - usermod -aG docker ubuntu || true
+
+  # --- App ---
+  - mkdir -p /opt/app
+  - git clone --branch ${branch} ${repo_url} /opt/app || (cd /opt/app && git pull)
+  - cd /opt/app && cp -n .env.example .env
+  # Resolve the HTTPS domain: use the provided one, else auto-detect the VM's public
+  # IP and use "<ip>.sslip.io" (a real Let's Encrypt cert with no domain to buy).
+  - cd /opt/app && DOM="${domain}"; if echo "$DOM" | grep -qiE 'changeme|pending'; then IP=$(curl -fsS https://api.ipify.org || curl -fsS https://ifconfig.me || true); [ -n "$IP" ] && DOM="$IP.sslip.io"; fi; sed -i '/^DOMAIN=/d' .env; echo "DOMAIN=$DOM" >> .env; printf '%s' "$DOM" > /opt/app/.deployed_domain
+
+  # --- Build + start the production stack (Caddy + agents + API + dashboard) ---
+  - cd /opt/app && DOMAIN="$(cat /opt/app/.deployed_domain)" docker compose -f docker-compose.yml -f docker-compose.prod.yml ${lite_flag} up -d --build
+  # Give Postgres a moment, then run migrations (uses the baked image code).
+  - sleep 30
+  - cd /opt/app && DOMAIN="$(cat /opt/app/.deployed_domain)" docker compose -f docker-compose.yml -f docker-compose.prod.yml ${lite_flag} run --rm api alembic upgrade head || true
+
+final_message: "Trading System demo is starting. Caddy will obtain HTTPS on first request."
