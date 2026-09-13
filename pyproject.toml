@@ -130,6 +130,9 @@ python_version = "3.11"
 strict = true
 ignore_missing_imports = true
 plugins = ["pydantic.mypy"]
+# The repository root has an __init__.py, so without this mypy derives module names from
+# the checkout directory ("Multi-agent-trading-system") and stops before checking anything.
+explicit_package_bases = true
 
 [[tool.mypy.overrides]]
 module = ["ccxt.*", "talib.*"]
