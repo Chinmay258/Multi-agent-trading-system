@@ -20,7 +20,7 @@ weighted score), backtested with **no lookahead** (signal at bar *i*, fill at ba
 open), realistic fees (0.1%/side) + slippage (0.05%/side), SL/TP brackets, and 2% sizing.
 
 It has **no demonstrable edge**: returns are tiny and statistically indistinguishable from
-random entry. The deployed XGBoost classifier scores ~0.42–0.49 accuracy on a 3-class
+random entry (it beats 153 of 200 random-entry runs; empirical p ≈ 0.24). The deployed XGBoost classifier scores ~0.42–0.49 accuracy on a 3-class
 problem where random is 0.33, and the HOLD class is essentially unlearned.
 
 ## 2. What we tried

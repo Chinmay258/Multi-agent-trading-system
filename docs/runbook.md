@@ -62,7 +62,7 @@ investigate** before letting trading continue.
 
 3. ExecutionAgent log line on startup:
    ```
-   "paper_broker_connected" initial_balance_usd=10000.0
+   "paper_broker_connected" cash_balance_usd=10000.0
    ```
 
 If `TRADING_MODE=live` is set unexpectedly, `PaperBroker.connect()`
@@ -94,20 +94,29 @@ curl -s http://localhost:8081/health | jq '{status, stale_agents, agent_count}'
 
 | Action | API call | Effect |
 | --- | --- | --- |
-| Pause   | `POST /control/command {"command":"PAUSE"}`    | Agents stop processing but stay alive |
-| Resume  | `POST /control/command {"command":"RESUME"}`   | Agents resume from paused state |
-| Halt    | `POST /control/halt`                            | Publishes `RiskOverride(requires_human_reset=true)`; ExecutionAgent stops placing orders until restarted |
+| Halt    | `POST /control/halt`                            | Writes the halt latch, then publishes `RiskOverride(requires_human_reset=true)`; agents stop and restart halted |
+| Resume  | `POST /control/resume`                          | Clears the halt latch; restart the agents to resume trading |
+| Command | `POST /control/command {"command":"PAUSE"}`    | Publishes to `system.command`. No agent acts on commands yet |
+
+Every control call needs the `X-API-Key` header matching `CONTROL_API_KEY`; without that
+setting the endpoints return 403. They are reachable only on the API port (nginx does
+not proxy `/control`):
+
+```bash
+curl -X POST -H "X-API-Key: $CONTROL_API_KEY" http://localhost:8000/control/halt
+```
 
 Halt is **load-bearing** — it is the same path the Risk agent itself
 takes when a limit is breached. After a halt:
 
 1. Identify the cause (`GET /agents`, ExecutionAgent logs, Slack alerts).
 2. Resolve the cause (close positions, adjust limits, fix the bug).
-3. Restart the affected agents to clear `_trading_halted`.
+3. Clear the latch with `POST /control/resume`, then restart the agents to clear
+   `_trading_halted`.
 
-There is intentionally no "resume from halt" API. Resetting a circuit
-breaker requires the operator to restart agents — that ceremony is the
-last guard before a runaway loop costs real money.
+The halt is latched in Redis (`system:trading_halted`). Docker's restart policy brings
+stopped agents back, and they read the latch at startup and stay halted, so a halt holds
+until an operator clears it.
 
 ---
 
@@ -128,7 +137,7 @@ Scrape from `http://<host>:9090/metrics` (port from
 | `trading_portfolio_daily_pnl_usd` | Gauge | Daily realised PnL, reset at UTC midnight |
 | `trading_open_positions_count` | Gauge | How many positions are open right now |
 | `trading_signal_confidence{symbol}` | Gauge | Confidence of the most recent TA signal |
-| `trading_data_age_seconds{symbol}` | Gauge | Seconds since the last candle for this symbol |
+| `trading_data_age_seconds{symbol}` | Gauge | Seconds since the latest published candle closed (primary timeframe) |
 | `trading_signal_generation_seconds{symbol}` | Histogram | Latency of indicator math + signal scoring |
 | `trading_order_fill_latency_seconds{mode}` | Histogram | Paper or live fill latency (paper is simulated) |
 | `trading_indicator_computation_seconds` | Histogram | Per-indicator compute time |
@@ -157,8 +166,9 @@ Run through this once per morning (or per shift). It takes ~3 minutes.
 
 1. **All agents up.** `min(trading_agent_up) == 1` — anything else is
    either a crash or a config drift.
-2. **Data freshness.** `max(trading_data_age_seconds) < 60` — primary
-   timeframe is 1m, anything older means the feed is stalling.
+2. **Data freshness.** `max(trading_data_age_seconds)` should stay below one
+   timeframe plus the poll interval. With the default 4h timeframe and 300 s poll,
+   anything above 14,700 s means the feed is stalling.
 3. **Daily PnL within limits.** `trading_portfolio_daily_pnl_usd`
    should be > `-5% × paper_initial_balance_usd`. If it's negative and
    large, expect the circuit breaker to trip soon.
@@ -192,7 +202,8 @@ launcher stdout (single-process). Look for the last
 
 ### Stale market data
 
-**Detect:** `trading_data_age_seconds > 60` for any symbol.
+**Detect:** `trading_data_age_seconds` above one timeframe plus the poll interval
+(14,700 s with the default 4h / 300 s) for any symbol.
 
 **Diagnose:** check MarketDataAgent logs for `poll_loop` errors;
 hit the exchange's status page; verify the symbol is still listed.
@@ -216,8 +227,8 @@ unusual fill prices, runaway sizing, or signal storms.
    `POST /positions/close`, planned).
 3. Investigate cause before restarting any agent. The halt is a
    feature, not a bug — do not bypass it.
-4. Restart the Risk and Execution agents in that order once the cause
-   is resolved.
+4. Once the cause is resolved, clear the halt latch (`POST /control/resume`)
+   and restart the Risk and Execution agents, in that order.
 
 ---
 
@@ -261,16 +272,21 @@ After cutover, repeat the daily checklist twice a day for the first week.
 
 ### Redis
 
-Redis is **ephemeral cache** in this system. Pub/sub messages are not
-persisted, and the cached portfolio state is recomputed by the Risk and
-Execution agents on startup. **Do not back up Redis.** If you lose the
-Redis instance, restart the agents and the cache repopulates within a
-heartbeat.
+Redis holds both cache and **state**. Pub/sub messages are not persisted,
+but the paper portfolio (`paper_portfolio:cash`, `paper_portfolio:positions`),
+the last 100 execution results, and the halt latch exist only in Redis.
+
+- Persistence: AOF with `appendfsync everysec` (up to ~1 s of writes can be
+  lost) plus an RDB snapshot (`save 60 1`), on the `redis_data` volume.
+- Eviction: `volatile-lru`, so keys without a TTL (portfolio, halt latch) are
+  never evicted.
+- Backup: copy `appendonly.aof` / `dump.rdb` from the `redis_data` volume if
+  the paper history matters. Losing Redis resets the paper portfolio to
+  `paper_initial_balance_usd`.
 
 ### Application state
 
-The in-memory `PortfolioState` inside the Risk agent is reconstructed
-from `paper_initial_balance_usd` on every start. After a clean shutdown
-this is correct; after a crash mid-trade you may need to manually
-reconcile open positions in the database against the broker UI before
-restarting the Risk agent.
+The Risk agent's in-memory ledger starts from `paper_initial_balance_usd`
+and adopts positions as their fills or closes arrive. After a crash
+mid-trade, compare Risk's heartbeat (`open_positions_count`) with
+`redis-cli GET paper_portfolio:positions` before resuming trading.

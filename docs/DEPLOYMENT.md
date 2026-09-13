@@ -150,6 +150,20 @@ and [`agents/execution/mt5_bridge.py`](../agents/execution/mt5_bridge.py).
 
 ---
 
+## Operating the deployed stack
+
+The control endpoints are not public: nginx does not proxy `/control`, and they are
+disabled until `CONTROL_API_KEY` is set in `.env`. To halt trading on the VM, call the API
+from inside the Docker network:
+
+```bash
+docker compose exec api sh -c 'curl -s -X POST -H "X-API-Key: $CONTROL_API_KEY" http://localhost:8000/control/halt'
+```
+
+The halt survives restarts. Clear it with `/control/resume`, then restart the agents.
+
+---
+
 ## Verifying the deployment
 
 ```bash
