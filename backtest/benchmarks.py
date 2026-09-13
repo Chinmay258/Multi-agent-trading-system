@@ -8,7 +8,9 @@ Two honest benchmarks every strategy result is compared against:
    complexity and trading costs.
 2. **Random entry** — the same execution model (next-open fills, SL/TP, fees) driven by
    random entries at a frequency matched to the strategy, averaged over many seeds. If
-   the strategy can't beat coin-flips, it has no edge.
+   the strategy can't beat coin-flips, it has no edge. Given the strategy's return, it
+   also reports how many random runs the strategy beat and the empirical one-sided
+   p-value: the chance a no-skill strategy does at least as well.
 """
 
 from __future__ import annotations
@@ -54,6 +56,7 @@ def random_entry(
     candles: list[OHLCVCandle],
     config: BacktestConfig,
     target_trades: int,
+    strategy_return_pct: float | None = None,
 ) -> dict:
     """
     Average metrics over ``config.random_runs`` random-entry simulations whose entry
@@ -93,7 +96,7 @@ def random_entry(
     k = len(final_returns)
     mean = lambda xs: round(sum(xs) / k, 4) if k else 0.0  # noqa: E731
     sorted_ret = sorted(final_returns)
-    return {
+    out = {
         "runs": k,
         "entry_prob": round(entry_prob, 5),
         "mean_total_return_pct": mean(final_returns),
@@ -103,3 +106,11 @@ def random_entry(
         "mean_sharpe": mean(sharpes),
         "mean_win_rate_pct": mean(win_rates),
     }
+    if strategy_return_pct is not None and k:
+        beats = sum(1 for r in final_returns if strategy_return_pct > r)
+        out["strategy_return_pct"] = round(strategy_return_pct, 4)
+        out["strategy_beats_runs"] = beats
+        out["strategy_percentile"] = round(100 * beats / k, 2)
+        # Empirical one-sided p-value; the +1s keep it from ever reporting exactly 0.
+        out["p_value_vs_random"] = round((k - beats + 1) / (k + 1), 4)
+    return out

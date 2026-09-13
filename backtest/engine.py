@@ -66,6 +66,9 @@ def _make_signal_fn(config: BacktestConfig) -> Callable[[Any], str | None]:
         from agents.technical_analysis.signal_generator import SignalGenerator
 
         gen = SignalGenerator()
+        # Filter on the backtest's own threshold only, so results do not depend on
+        # TA_MIN_SIGNAL_CONFIDENCE in the environment or a local .env file.
+        gen._ta_cfg = gen._ta_cfg.model_copy(update={"min_signal_confidence": 0.0})
 
         def signal_fn(buf: Any) -> str | None:
             sig = gen.generate(buf)

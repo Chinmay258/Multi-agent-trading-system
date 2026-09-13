@@ -123,7 +123,12 @@ def main() -> int:
 
     bh_curve, bh_metrics = buy_and_hold(candles, cfg)
     rnd = (
-        random_entry(candles, cfg, target_trades=strat_metrics["num_trades"])
+        random_entry(
+            candles,
+            cfg,
+            target_trades=strat_metrics["num_trades"],
+            strategy_return_pct=strat_metrics["total_return_pct"],
+        )
         if strat_metrics["num_trades"]
         else {}
     )
@@ -220,7 +225,8 @@ def main() -> int:
     print(
         f"\nVerdict: baseline(rules) {strat_metrics['total_return_pct']}%  vs  "
         f"buy&hold {bh_metrics['total_return_pct']}%  vs  random "
-        f"{rnd.get('mean_total_return_pct', 'n/a')}%  |  Sharpe {strat_metrics['sharpe']}  |  "
+        f"{rnd.get('mean_total_return_pct', 'n/a')}% (p={rnd.get('p_value_vs_random', 'n/a')})  |  "
+        f"Sharpe {strat_metrics['sharpe']}  |  "
         f"ML acc {ml.get('accuracy', 'n/a')} (random {ml.get('random_baseline_accuracy', '0.33')})"
     )
     if improved is not None:
