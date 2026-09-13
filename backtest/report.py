@@ -227,8 +227,14 @@ def generate_report(results_dir: Path, payload: dict[str, Any]) -> dict[str, Pat
 
     rnd_row = ""
     if rnd:
+        rnd_label = f"Random entry (mean of {rnd.get('runs')})"
+        if rnd.get("p_value_vs_random") is not None:
+            rnd_label += (
+                f" — strategy beats {rnd['strategy_beats_runs']}/{rnd.get('runs')} runs,"
+                f" empirical p = {rnd['p_value_vs_random']}"
+            )
         rnd_row = (
-            f"<tr><td>Random entry (mean of {rnd.get('runs')})</td>"
+            f"<tr><td>{rnd_label}</td>"
             f"<td>{rnd.get('mean_total_return_pct')}</td><td>{rnd.get('mean_sharpe')}</td>"
             f"<td>{rnd.get('mean_win_rate_pct')}</td></tr>"
         )
@@ -359,6 +365,11 @@ performance. No warranty; use at your own risk.</div>
             ]
             if rnd:
                 lines.append(f"Random-entry mean return: {rnd.get('mean_total_return_pct')} %")
+                if rnd.get("p_value_vs_random") is not None:
+                    lines.append(
+                        f"Beats {rnd['strategy_beats_runs']}/{rnd.get('runs')} random runs "
+                        f"(empirical p = {rnd['p_value_vs_random']})"
+                    )
             if ml.get("available"):
                 lines += [
                     "",
