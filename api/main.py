@@ -87,7 +87,7 @@ async def _heartbeat_watcher(bus: MessageBus, registry: dict[str, Any]) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage startup and shutdown of Redis connections and background tasks."""
-    bus = MessageBus()
+    bus = MessageBus(owner="api")
     await bus.connect()
 
     heartbeat_registry: dict[str, Any] = {}

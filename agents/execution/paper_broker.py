@@ -3,9 +3,8 @@ agents/execution/paper_broker.py
 ----------------------------------
 PaperBroker — simulated execution adapter for paper trading.
 
-Implements ExecutionBroker exactly. Fills orders at mid-price ± configurable
-slippage, simulates partial fills probabilistically, and tracks a paper
-portfolio of cash + open positions in memory.
+Implements ExecutionBroker exactly. Fills orders at the signal's reference price ±
+slippage, simulates partial fills, and tracks a paper portfolio of cash + open positions.
 
 Design invariant: this class must NEVER place a real order.
 assert_paper_mode() is called at connect() and place_order() to enforce this.
@@ -13,13 +12,18 @@ If TRADING_MODE is switched to "live", both calls raise RuntimeError immediately
 
 Paper fill mechanics:
 - Reference price comes from assessment.original_proposal.signal.technical_signal.price
-- BUY fills at ref_price * (1 + slippage)  [slightly above mid, simulating ask side]
-- SELL fills at ref_price * (1 - slippage) [slightly below mid, simulating bid side]
-- Slippage default: 0.05% (DEFAULT_SLIPPAGE_PCT)
-- Partial fills: 20% probability, 60–99% of requested quantity
+- BUY fills at ref_price * (1 + slippage); SELL fills at ref_price * (1 - slippage)
+- Slippage 0.05% (DEFAULT_SLIPPAGE_PCT); taker fee 0.1% of fill notional
+- Partial fills: 20% probability, 60–99% of requested quantity (opening orders only)
 - Simulated latency: uniform [20ms, 150ms] via asyncio.sleep
-- Taker fee: 0.1% of fill notional
+- One position per symbol:
+    * an order on the same side as an open position is rejected (no stacking)
+    * an order on the opposite side closes the open position at the reference price
+- Opening a position (long or short) reserves notional + fee from cash. Closing returns
+  the cost basis plus gross PnL minus the closing fee; realized_pnl_usd is the cash
+  returned minus the cost basis, so it is net of both fees.
 - Idempotency: place_order with the same proposal_id returns the cached result
+  (the most recent 1,000 orders are remembered).
 """
 
 from __future__ import annotations
@@ -28,9 +32,10 @@ import asyncio
 import json
 import random
 import time as _time
+from collections import OrderedDict
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from agents.execution.broker_interface import (
     BrokerBalance,
@@ -69,9 +74,16 @@ _PARTIAL_FILL_RANGE: tuple[float, float] = (0.60, 0.99)
 #: Simulated round-trip latency range in seconds
 _LATENCY_RANGE: tuple[float, float] = (0.020, 0.150)
 
+#: How many filled orders to remember for idempotency
+_IDEMPOTENCY_CACHE_SIZE = 1000
+
 #: Redis keys for persisted portfolio state (no TTL — these survive restarts)
 _PORTFOLIO_CASH_KEY = "paper_portfolio:cash"
 _PORTFOLIO_POSITIONS_KEY = "paper_portfolio:positions"
+
+
+def _side_str(side: OrderSide | str) -> str:
+    return side.value if isinstance(side, OrderSide) else str(side)
 
 
 @dataclass
@@ -82,7 +94,7 @@ class _PaperPosition:
     side: str  # "buy" | "sell"
     quantity: Decimal
     entry_price: Decimal
-    cost_usd: Decimal  # cash reserved for this position (fill cost + fee)
+    cost_usd: Decimal  # cash reserved for this position (fill notional + fee)
 
 
 class PaperBroker(ExecutionBroker):
@@ -100,8 +112,8 @@ class PaperBroker(ExecutionBroker):
         self._settings = settings
         self._cash_balance: Decimal = Decimal(str(settings.paper_initial_balance_usd))
         self._positions: dict[str, _PaperPosition] = {}
-        # proposal_id (str) → ExecutionResult for idempotency
-        self._filled_orders: dict[str, ExecutionResult] = {}
+        # proposal_id (str) → ExecutionResult for idempotency (bounded, oldest evicted)
+        self._filled_orders: OrderedDict[str, ExecutionResult] = OrderedDict()
         self._log = get_logger("paper_broker")
         # Injected by ExecutionAgent.setup() before connect() is called
         self._bus: MessageBus | None = None
@@ -140,19 +152,18 @@ class PaperBroker(ExecutionBroker):
     async def connect(self) -> None:
         """Verify paper mode, restore portfolio state from Redis, and log startup.
 
-        Restore is best-effort via the injected MessageBus pool. If the bus
-        is not yet set (unit tests) or Redis has no prior state, the broker
-        initialises fresh from paper_initial_balance_usd.
+        Restore is best-effort via the injected MessageBus. If the bus is not set
+        (unit tests) or Redis has no prior state, the broker initialises fresh from
+        paper_initial_balance_usd.
         """
         self._settings.assert_paper_mode()
 
-        pool = self._bus._pool if self._bus is not None else None  # noqa: SLF001
-        if pool is not None:
+        if self._bus is not None and self._bus.connected:
             try:
-                cash_raw = await pool.get(_PORTFOLIO_CASH_KEY)
+                cash_raw = await self._bus.kv_get(_PORTFOLIO_CASH_KEY)
                 if cash_raw is not None:
                     self._cash_balance = Decimal(cash_raw)
-                    positions_raw = await pool.get(_PORTFOLIO_POSITIONS_KEY)
+                    positions_raw = await self._bus.kv_get(_PORTFOLIO_POSITIONS_KEY)
                     if positions_raw is not None:
                         positions_data = json.loads(positions_raw)
                         self._positions = {
@@ -171,25 +182,14 @@ class PaperBroker(ExecutionBroker):
                         open_positions=len(self._positions),
                     )
                 else:
-                    self._log.info(
-                        "portfolio_initialised",
-                        balance=float(self._cash_balance),
-                    )
+                    self._log.info("portfolio_initialised", balance=float(self._cash_balance))
             except Exception as exc:
                 self._log.warning("portfolio_restore_failed", error=str(exc))
-                self._log.info(
-                    "portfolio_initialised",
-                    balance=float(self._cash_balance),
-                )
+                self._log.info("portfolio_initialised", balance=float(self._cash_balance))
         else:
-            self._log.info(
-                "portfolio_initialised",
-                balance=float(self._cash_balance),
-            )
+            self._log.info("portfolio_initialised", balance=float(self._cash_balance))
 
         # Seed the keys immediately so they exist before the first fill.
-        # On fresh init this writes the starting balance; on restore this
-        # is a no-op re-write of what was already in Redis.
         await self._save_portfolio_state()
 
         self._log.info(
@@ -211,17 +211,16 @@ class PaperBroker(ExecutionBroker):
     # ------------------------------------------------------------------
 
     async def _save_portfolio_state(self) -> None:
-        """Persist cash balance and open positions via the MessageBus Redis pool.
+        """Persist cash balance and open positions via the MessageBus.
 
-        No-op when the bus is not injected (unit tests). Called after every
-        portfolio-mutating operation so state survives an unexpected restart.
-        Keys have no TTL — they are permanent portfolio state, not cache.
+        No-op when the bus is not injected or not connected (unit tests). Called after
+        every portfolio-mutating operation so state survives an unexpected restart.
+        Keys have no TTL — they are portfolio state, not cache.
         """
-        pool = self._bus._pool if self._bus is not None else None  # noqa: SLF001
-        if pool is None:
+        if self._bus is None or not self._bus.connected:
             return
         try:
-            await pool.set(_PORTFOLIO_CASH_KEY, str(self._cash_balance))
+            await self._bus.kv_set(_PORTFOLIO_CASH_KEY, str(self._cash_balance))
             positions_data = {
                 symbol: {
                     "symbol": pos.symbol,
@@ -232,7 +231,7 @@ class PaperBroker(ExecutionBroker):
                 }
                 for symbol, pos in self._positions.items()
             }
-            await pool.set(_PORTFOLIO_POSITIONS_KEY, json.dumps(positions_data))
+            await self._bus.kv_set(_PORTFOLIO_POSITIONS_KEY, json.dumps(positions_data))
             self._log.info(
                 "portfolio_state_saved",
                 cash=float(self._cash_balance),
@@ -240,6 +239,11 @@ class PaperBroker(ExecutionBroker):
             )
         except Exception as exc:
             self._log.warning("portfolio_save_failed", error=str(exc))
+
+    def _remember(self, proposal_id: str, result: ExecutionResult) -> None:
+        self._filled_orders[proposal_id] = result
+        if len(self._filled_orders) > _IDEMPOTENCY_CACHE_SIZE:
+            self._filled_orders.popitem(last=False)
 
     # ------------------------------------------------------------------
     # ExecutionBroker — order operations
@@ -254,19 +258,19 @@ class PaperBroker(ExecutionBroker):
           2. Return cached result if this proposal was already filled (idempotency).
           3. Extract reference price from technical signal.
           4. Sleep to simulate network/exchange latency.
-          5. Compute fill price with slippage.
-          6. Simulate partial fill probabilistically.
-          7. Check cash balance; raise InsufficientBalanceError if short.
-          8. Update in-memory portfolio.
-          9. Build, cache, and return ExecutionResult with is_paper=True.
+          5. If the symbol has an open position: reject a same-side order, or close the
+             position when the order is on the opposite side.
+          6. Otherwise compute the fill price with slippage and a possible partial fill,
+             check cash, open the position, and return the result.
         """
         self._settings.assert_paper_mode()
 
         # --- Idempotency ---
         pid = str(assessment.proposal_id)
-        if pid in self._filled_orders:
+        cached = self._filled_orders.get(pid)
+        if cached is not None:
             self._log.info("paper_order_duplicate_skipped", proposal_id=pid)
-            return self._filled_orders[pid]
+            return cached
 
         # --- Reference price ---
         tech = assessment.original_proposal.signal.technical_signal
@@ -279,18 +283,39 @@ class PaperBroker(ExecutionBroker):
             raise OrderRejectedError(f"reference price must be positive, got {ref_price}")
 
         # --- Latency simulation ---
-        # Capture a start timestamp so we can observe the end-to-end fill
-        # duration (simulated network latency + slippage math + bookkeeping)
-        # into the ORDER_FILL_LATENCY_SECONDS histogram once the result is
-        # constructed. Recording on exceptions is intentionally skipped:
-        # those paths raise and the caller will produce its own error metric.
         _fill_start = _time.perf_counter()
         await asyncio.sleep(random.uniform(*_LATENCY_RANGE))
 
-        # --- Fill price with slippage ---
+        symbol = assessment.original_proposal.symbol
         side = assessment.original_proposal.side
+        side_str = _side_str(side)
+
+        # --- Existing position: no stacking; opposite side closes it ---
+        existing = self._positions.get(symbol)
+        if existing is not None:
+            if existing.side == side_str:
+                raise OrderRejectedError(
+                    f"{symbol} already has an open {existing.side} position; "
+                    "stacking is not supported"
+                )
+            close_result = await self._close(
+                symbol,
+                ref_price,
+                proposal_id=assessment.proposal_id,
+                assessment_id=assessment.assessment_id,
+            )
+            if close_result is None:  # pragma: no cover - guarded by the lookup above
+                raise OrderRejectedError(f"no open position to close for {symbol}")
+            self._remember(pid, close_result)
+            ORDERS_PLACED.labels(symbol=symbol, side=side_str, mode="paper").inc()
+            ORDER_FILL_LATENCY_SECONDS.labels(mode="paper").observe(
+                _time.perf_counter() - _fill_start
+            )
+            return close_result
+
+        # --- Fill price with slippage ---
         slippage = Decimal(str(DEFAULT_SLIPPAGE_PCT))
-        if side == OrderSide.BUY:
+        if side_str == OrderSide.BUY.value:
             fill_price = ref_price * (Decimal("1") + slippage)
         else:
             fill_price = ref_price * (Decimal("1") - slippage)
@@ -332,11 +357,10 @@ class PaperBroker(ExecutionBroker):
             )
 
         # --- Update paper portfolio ---
-        symbol = assessment.original_proposal.symbol
         self._cash_balance -= total_cost
         self._positions[symbol] = _PaperPosition(
             symbol=symbol,
-            side=side.value if isinstance(side, OrderSide) else str(side),
+            side=side_str,
             quantity=fill_qty,
             entry_price=fill_price,
             cost_usd=total_cost,
@@ -358,13 +382,9 @@ class PaperBroker(ExecutionBroker):
             fee_currency="USDT",
             is_paper=True,
         )
-        self._filled_orders[pid] = result
+        self._remember(pid, result)
 
-        ORDERS_PLACED.labels(
-            symbol=symbol,
-            side=side.value if isinstance(side, OrderSide) else str(side),
-            mode="paper",
-        ).inc()
+        ORDERS_PLACED.labels(symbol=symbol, side=side_str, mode="paper").inc()
         ORDER_FILL_LATENCY_SECONDS.labels(mode="paper").observe(_time.perf_counter() - _fill_start)
 
         await self._save_portfolio_state()
@@ -372,7 +392,7 @@ class PaperBroker(ExecutionBroker):
         self._log.info(
             "paper_order_filled",
             symbol=symbol,
-            side=str(side),
+            side=side_str,
             status=status,
             fill_price=float(fill_price),
             fill_qty=float(fill_qty),
@@ -398,7 +418,7 @@ class PaperBroker(ExecutionBroker):
                 side=pos.side,
                 quantity=pos.quantity,
                 entry_price=pos.entry_price,
-                # No live price feed in paper mode — use entry as current price.
+                # No live price feed inside the broker — use entry as current price.
                 current_price=pos.entry_price,
                 unrealised_pnl_usd=Decimal("0"),
             )
@@ -413,7 +433,7 @@ class PaperBroker(ExecutionBroker):
         free_margin   = cash available for new positions
         used_margin   = cost basis of all open positions
         """
-        used = sum(pos.cost_usd for pos in self._positions.values())
+        used = sum((pos.cost_usd for pos in self._positions.values()), Decimal("0"))
         return BrokerBalance(
             total_equity_usd=self._cash_balance + used,
             free_margin_usd=self._cash_balance,
@@ -428,54 +448,82 @@ class PaperBroker(ExecutionBroker):
     # ExecutionBroker — optional overrides
     # ------------------------------------------------------------------
 
-    async def close_position(self, symbol: str) -> ExecutionResult | None:
+    async def close_position(
+        self, symbol: str, price: Decimal | None = None
+    ) -> ExecutionResult | None:
         """
-        Close the open position for symbol at a simulated market price.
+        Close the open position for ``symbol`` at ``price`` (the current market price).
 
-        Returns None if no position is open for that symbol.
-        Uses a synthetic proposal_id/assessment_id since this is an
-        operator-initiated close, not triggered by a RiskAssessment.
+        Returns None if no position is open. Without a price the position is closed at its
+        entry price, which realises only fees and slippage. Uses a synthetic
+        proposal_id/assessment_id since this close is not tied to a RiskAssessment.
         """
-        pos = self._positions.pop(symbol, None)
+        pos = self._positions.get(symbol)
         if pos is None:
             self._log.info("paper_close_position_no_op", symbol=symbol)
             return None
+        ref_price = price if price is not None and price > Decimal("0") else pos.entry_price
+        return await self._close(symbol, ref_price, proposal_id=uuid4(), assessment_id=uuid4())
 
-        # Reverse side for the closing leg
-        close_side = OrderSide.SELL if pos.side == "buy" else OrderSide.BUY
+    async def _close(
+        self,
+        symbol: str,
+        ref_price: Decimal,
+        proposal_id: UUID,
+        assessment_id: UUID,
+    ) -> ExecutionResult | None:
+        """Close a position at ``ref_price`` ± slippage and realise its PnL."""
+        pos = self._positions.pop(symbol, None)
+        if pos is None:
+            return None
+
         slippage = Decimal(str(DEFAULT_SLIPPAGE_PCT))
-        if close_side == OrderSide.SELL:
-            close_price = pos.entry_price * (Decimal("1") - slippage)
+        if pos.side == OrderSide.BUY.value:
+            # Closing a long = selling slightly below the reference price.
+            close_side = OrderSide.SELL
+            exit_price = (ref_price * (Decimal("1") - slippage)).quantize(
+                _QTY_PLACES, rounding=ROUND_DOWN
+            )
+            notional = pos.quantity * exit_price
+            fee = (notional * _TAKER_FEE_PCT).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            cash_returned = notional - fee
         else:
-            close_price = pos.entry_price * (Decimal("1") + slippage)
-        close_price = close_price.quantize(_QTY_PLACES, rounding=ROUND_DOWN)
+            # Closing a short = buying back slightly above the reference price.
+            close_side = OrderSide.BUY
+            exit_price = (ref_price * (Decimal("1") + slippage)).quantize(
+                _QTY_PLACES, rounding=ROUND_DOWN
+            )
+            notional = pos.quantity * exit_price
+            fee = (notional * _TAKER_FEE_PCT).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            gross_pnl = (pos.entry_price - exit_price) * pos.quantity
+            cash_returned = pos.cost_usd + gross_pnl - fee
 
-        notional = pos.quantity * close_price
-        fee = (notional * _TAKER_FEE_PCT).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-        proceeds = notional - fee
-        self._cash_balance += proceeds
+        realized = (cash_returned - pos.cost_usd).quantize(Decimal("0.01"))
+        self._cash_balance += cash_returned
 
         await self._save_portfolio_state()
 
         result = ExecutionResult(
-            proposal_id=uuid4(),
-            assessment_id=uuid4(),
+            proposal_id=proposal_id,
+            assessment_id=assessment_id,
             symbol=symbol,
             side=close_side,
             order_type=OrderType.MARKET,
             status=OrderStatus.FILLED,
             requested_quantity=pos.quantity,
             filled_quantity=pos.quantity,
-            average_fill_price=close_price,
+            average_fill_price=exit_price,
             total_cost_usd=notional,
             fee_usd=fee,
             fee_currency="USDT",
             is_paper=True,
+            realized_pnl_usd=realized,
         )
         self._log.info(
             "paper_position_closed",
             symbol=symbol,
-            close_price=float(close_price),
-            proceeds_usd=float(proceeds),
+            close_price=float(exit_price),
+            realized_pnl_usd=float(realized),
+            cash_balance_usd=float(self._cash_balance),
         )
         return result
