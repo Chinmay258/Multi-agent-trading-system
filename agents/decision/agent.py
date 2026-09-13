@@ -328,4 +328,4 @@ if __name__ == "__main__":
 
     from agents.base import run_agent
 
-    asyncio.run(run_agent(DecisionAgent()))
+    asyncio.run(run_agent(DecisionAgent(), install_signal_handlers=True))

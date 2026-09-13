@@ -399,4 +399,4 @@ if __name__ == "__main__":
     from core.logging import configure_logging
 
     configure_logging()
-    asyncio.run(run_agent(TechnicalAnalysisAgent()))
+    asyncio.run(run_agent(TechnicalAnalysisAgent(), install_signal_handlers=True))

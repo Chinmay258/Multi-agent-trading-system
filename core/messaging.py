@@ -14,7 +14,9 @@ Design decisions:
 - publish() accepts any BaseMarketModel — serialisation is handled here,
   not in the calling agent.
 - subscribe() is an async generator. Agents consume it with async for, which
-  blocks naturally without spinning. The generator handles reconnection.
+  blocks naturally without spinning. It does NOT reconnect: if the Redis
+  connection drops the generator raises, and the agent's supervisor (or the
+  container restart policy) restarts the process.
 - Type-safe deserialisation: subscribe() takes a model class and returns
   typed instances — callers never parse JSON themselves.
 - Dead letter handling: messages that fail to deserialise are logged and
@@ -48,9 +50,15 @@ from redis.asyncio.client import PubSub
 
 from core.config import get_settings
 from core.logging import get_logger
+from core.metrics import MESSAGES_CONSUMED
 from core.models.market import BaseMarketModel
 
 logger = get_logger("messaging")
+
+# Redis key holding the persisted trading-halt latch (value = reason). Set by
+# POST /control/halt and by the Risk agent's emergency halt; every agent reads it at
+# startup, so a halt survives container restarts until it is explicitly cleared.
+HALT_KEY = "system:trading_halted"
 
 T = TypeVar("T", bound=BaseMarketModel)
 
@@ -148,8 +156,10 @@ class MessageBus:
             ...
     """
 
-    def __init__(self) -> None:
+    def __init__(self, owner: str = "unknown") -> None:
         self._settings = get_settings()
+        # Used only to label the messages-consumed metric.
+        self._owner = owner
         self._pool: aioredis.Redis | None = None
         self._connected = False
 
@@ -245,7 +255,8 @@ class MessageBus:
         Subscribe to a channel and yield typed model instances.
 
         This is an infinite async generator — it runs until the caller
-        breaks out or the agent shuts down. Reconnects on transient errors.
+        breaks out or the agent shuts down. Per-message errors are logged and
+        skipped; a dropped connection ends the generator with an exception.
 
         Each call creates its own dedicated PubSub connection so concurrent
         subscribers (e.g. run_loop + _risk_override_listener) never race on
@@ -276,6 +287,7 @@ class MessageBus:
                         continue
                     message = self._deserialise(raw["data"], model_class, channel)
                     if message is not None:
+                        MESSAGES_CONSUMED.labels(agent=self._owner, channel=channel).inc()
                         yield message
                 except asyncio.CancelledError:
                     break
@@ -315,6 +327,7 @@ class MessageBus:
                     ch = raw["channel"]
                     message = self._deserialise(raw["data"], model_class, ch)
                     if message is not None:
+                        MESSAGES_CONSUMED.labels(agent=self._owner, channel=ch).inc()
                         yield ch, message
                 except asyncio.CancelledError:
                     break
@@ -353,6 +366,39 @@ class MessageBus:
         if not self._pool:
             raise RuntimeError("MessageBus not connected.")
         await self._pool.delete(key)
+
+    # ------------------------------------------------------------------
+    # Plain key-value and list helpers (state, not pub/sub)
+    # ------------------------------------------------------------------
+
+    @property
+    def connected(self) -> bool:
+        """True once connect() has created the connection pool."""
+        return self._connected and self._pool is not None
+
+    async def kv_get(self, key: str) -> str | None:
+        """Return the raw string stored at key, or None."""
+        if not self._pool:
+            raise RuntimeError("MessageBus not connected.")
+        return await self._pool.get(key)
+
+    async def kv_set(self, key: str, value: str, ttl_seconds: int | None = None) -> None:
+        """Store a raw string. With ttl_seconds the key expires (cache); without, it persists (state)."""
+        if not self._pool:
+            raise RuntimeError("MessageBus not connected.")
+        if ttl_seconds is None:
+            await self._pool.set(key, value)
+        else:
+            await self._pool.setex(key, ttl_seconds, value)
+
+    async def list_push_capped(self, key: str, value: str, max_len: int) -> None:
+        """LPUSH + LTRIM inside one MULTI/EXEC so the list never exceeds max_len."""
+        if not self._pool:
+            raise RuntimeError("MessageBus not connected.")
+        async with self._pool.pipeline(transaction=True) as pipe:
+            pipe.lpush(key, value)
+            pipe.ltrim(key, 0, max_len - 1)
+            await pipe.execute()
 
     # ------------------------------------------------------------------
     # Health

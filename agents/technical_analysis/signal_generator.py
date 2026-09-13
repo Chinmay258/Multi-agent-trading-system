@@ -66,6 +66,7 @@ from agents.technical_analysis.indicators import (
 from core.config import get_settings
 from core.exceptions import InsufficientDataError
 from core.logging import get_logger
+from core.metrics import INDICATOR_COMPUTATION_SECONDS, time_histogram
 from core.models.signals import (
     IndicatorName,
     IndicatorReading,
@@ -361,7 +362,8 @@ class SignalGenerator:
         Any other exception is logged as a warning (unexpected computation error).
         """
         try:
-            return fn(*args)
+            with time_histogram(INDICATOR_COMPUTATION_SECONDS):
+                return fn(*args)
         except InsufficientDataError as e:
             logger.debug("indicator_insufficient_data", indicator=name, reason=str(e))
             return None

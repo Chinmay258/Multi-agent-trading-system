@@ -15,7 +15,9 @@ Regenerate everything with `make eval` →
 - **Realistic costs.** 0.1% taker fee + 0.05% slippage **per side** — matched exactly to the
   live `PaperBroker`.
 - **Benchmarks.** Every strategy result is compared against **buy-and-hold** and a
-  **random-entry** baseline (200 seeds, trade-frequency matched).
+  **random-entry** baseline (200 seeds, trade-frequency matched). The harness reports how
+  many random runs the strategy beat and the empirical one-sided p-value: the chance a
+  no-skill strategy does at least as well.
 - **Walk-forward for ML.** The ML strategy retrains on an expanding window of **past bars
   only** (a training sample's label window must fully close before the prediction bar), so no
   future return ever leaks into training.
@@ -35,7 +37,9 @@ The harness lives in [`backtest/`](../backtest) and is unit-tested — including
 | Walk-forward ML (Phase 5 attempt) | −0.24% | −0.18 | 38% | 137 |
 
 **The honest finding: no demonstrable edge.** The strategy's returns are tiny and
-statistically **indistinguishable from random entry**. It "beats" buy-and-hold only by
+statistically **indistinguishable from random entry**: it beats 153 of the 200 random-entry
+runs (76.5th percentile), an empirical one-sided **p-value of 0.24**. Random entry does at
+least as well about a quarter of the time, far from the conventional 0.05 threshold. It "beats" buy-and-hold only by
 sitting out most of a falling market (low exposure ≠ predictive skill), and the conservative
 2% position sizing caps both risk and reward — so judge it on Sharpe / vs-random, not dollars.
 
@@ -59,7 +63,8 @@ legitimate, valuable outcome. Full write-up: [MODEL_CHANGES.md](MODEL_CHANGES.md
 
 - Single asset, single timeframe, modest bundled history — results are indicative, not a
   multi-year, multi-regime validation.
-- Paper mode has no native SL/TP, so the backtest applies an explicit, documented SL/TP
-  bracket; live paper behaviour can differ.
+- Live paper trading checks stop-loss / take-profit every 30 s against the latest ticker
+  price, while the backtest checks each bar's high and low, so live exits can differ.
+- Both the live pipeline and the backtest use closed candles only.
 - No survivorship/regime adjustments; flat per-side cost model (real thin-book fills would be
   worse). See the "Limitations" section embedded in the generated report.

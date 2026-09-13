@@ -226,7 +226,9 @@ class MT5Bridge(ExecutionBroker):
         )
         return response.get("status") == "ok"
 
-    async def close_position(self, symbol: str) -> ExecutionResult | None:
+    async def close_position(
+        self, symbol: str, price: Decimal | None = None
+    ) -> ExecutionResult | None:
         """Queue a CLOSE_POSITION command and wait for the EA to market-close it."""
         mt5_symbol = self._mapper.to_mt5(symbol)
         try:

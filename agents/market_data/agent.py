@@ -36,18 +36,21 @@ Design decisions:
   (Redis). Persistence is async but awaited — we don't want to lose data
   silently. If DB write fails, we log and continue (market data is more
   valuable as a live feed than a historical record).
-- The primary timeframe (first in MARKET_DATA_OHLCV_TIMEFRAMES) is used
-  for data freshness checks. This is typically "1m".
+- Only closed candles are published: the newest row an exchange returns is still
+  forming, and publishing it would put partial bars into the indicators.
+- The primary timeframe (first in MARKET_DATA_OHLCV_TIMEFRAMES) is used for the
+  data-freshness metric: seconds since the latest published candle closed.
 """
 
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 
 from sqlalchemy import text
 
 from agents.base import BaseAgent, run_agent
-from agents.market_data.normalizer import TIMEFRAME_SECONDS, OHLCVNormaliser
+from agents.market_data.normalizer import TIMEFRAME_SECONDS, OHLCVNormaliser, closed_candles
 from core.db.connection import get_session
 from core.exceptions import ExchangeConnectionError
 from core.logging import get_logger
@@ -167,14 +170,16 @@ class MarketDataAgent(BaseAgent):
 
         while self._should_continue():
             try:
-                # Fetch the last 2 candles — enough to detect the latest close
-                candles = await self._source.fetch_ohlcv(symbol, timeframe, limit=2)
-                clean_candles = self._normaliser.process_batch(candles)
+                # Fetch the last 3 candles. The newest is usually still forming, so only
+                # closed ones are kept; each candle is published once, after it closes.
+                candles = await self._source.fetch_ohlcv(symbol, timeframe, limit=3)
+                clean_candles = self._normaliser.process_batch(closed_candles(candles))
 
                 for candle in clean_candles:
                     await self._publish_candle(candle)
                     await self._persist_candle(candle)
 
+                self._update_data_age(symbol, timeframe)
                 self._record_success()
 
             except ExchangeConnectionError as e:
@@ -223,10 +228,6 @@ class MarketDataAgent(BaseAgent):
         """Publish a normalised candle to the Redis event bus."""
         try:
             await self.bus.publish(candle)
-            # A candle has just been received and forwarded; its age relative
-            # to "now" is effectively zero. Scrapes between candles will see
-            # this gauge stay flat, which Prometheus rate panels handle fine.
-            DATA_AGE_SECONDS.labels(symbol=candle.symbol).set(0.0)
             MESSAGES_PUBLISHED.labels(agent=self.name, channel=candle.channel_key).inc()
             self.log.debug(
                 "candle_published",
@@ -327,7 +328,7 @@ class MarketDataAgent(BaseAgent):
             for timeframe in cfg.ohlcv_timeframes:
                 try:
                     candles = await self._source.fetch_ohlcv(symbol, timeframe, limit=limit)
-                    clean = self._normaliser.process_batch(candles)
+                    clean = self._normaliser.process_batch(closed_candles(candles))
 
                     # Persist and publish all historical candles so the TA
                     # agent buffer warms up via the live feed as a fallback
@@ -358,17 +359,37 @@ class MarketDataAgent(BaseAgent):
     # Health reporting
     # ------------------------------------------------------------------
 
+    def _candle_age_seconds(self, symbol: str, timeframe: str) -> float | None:
+        """Seconds since the most recent published candle for this pair closed."""
+        last = self._normaliser.get_last_candle(symbol, timeframe)
+        if last is None:
+            return None
+        closed_at = last.timestamp.timestamp() + TIMEFRAME_SECONDS.get(timeframe, 60)
+        return max(0.0, datetime.now(UTC).timestamp() - closed_at)
+
+    def _update_data_age(self, symbol: str, timeframe: str) -> None:
+        """Export freshness for the primary timeframe (the one signals are generated on)."""
+        timeframes = self.settings.market_data.ohlcv_timeframes
+        if timeframes and timeframe != timeframes[0]:
+            return
+        age = self._candle_age_seconds(symbol, timeframe)
+        if age is not None:
+            DATA_AGE_SECONDS.labels(symbol=symbol).set(age)
+
     def health_extra(self) -> dict:
         """Include data freshness info in heartbeat payloads."""
         cfg = self.settings.market_data
         primary_tf = cfg.ohlcv_timeframes[0] if cfg.ohlcv_timeframes else "1m"
 
+        # A healthy feed publishes each candle shortly after it closes, so the age of the
+        # latest closed candle should stay under one timeframe plus the poll interval.
+        stale_after = TIMEFRAME_SECONDS.get(primary_tf, 60) + cfg.poll_interval_seconds
         freshness = {}
         for symbol in cfg.symbols:
-            age = self._normaliser.get_data_age_seconds(symbol, primary_tf)
+            age = self._candle_age_seconds(symbol, primary_tf)
             freshness[symbol] = {
                 "age_seconds": round(age, 1) if age is not None else None,
-                "stale": age is not None and age > self.settings.risk.max_data_staleness_seconds,
+                "stale": age is not None and age > stale_after,
             }
 
         return {
@@ -390,4 +411,4 @@ if __name__ == "__main__":
     from core.logging import configure_logging
 
     configure_logging()
-    asyncio.run(run_agent(MarketDataAgent()))
+    asyncio.run(run_agent(MarketDataAgent(), install_signal_handlers=True))

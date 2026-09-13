@@ -1,40 +1,47 @@
 """
 api/routers/control.py
 -----------------------
-Control plane endpoints — send commands to agents or trigger emergency halts.
+Control plane endpoints — send commands to agents, halt or resume trading.
 
-Endpoints:
+Endpoints (all require the X-API-Key header; disabled with HTTP 403 until the
+CONTROL_API_KEY setting is configured):
     POST /control/command       — broadcast a SystemCommandMessage to the bus
-    POST /control/halt          — trigger an emergency RiskOverride (trading halt)
+    POST /control/halt          — persist the halt latch and publish a RiskOverride
+    POST /control/resume        — clear the halt latch (agents resume after a restart)
     POST /control/test_order    — inject a minimal test order through MT5 (MT5 mode only)
 
-These endpoints publish to Redis pub/sub. Agents that subscribe to
-system.command or system.risk_override will act on the messages. There is no
-acknowledgement — the publish is fire-and-forget.
+These endpoints publish to Redis pub/sub. There is no acknowledgement — the publish is
+fire-and-forget.
 
-/control/halt publishes a RiskOverride with requires_human_reset=True. This
-causes every agent's inherited _risk_override_listener to set _trading_halted
-and call stop() on itself. To resume trading, the agents must be restarted
-manually (or via orchestration).
+Halt semantics: /control/halt first writes the halt latch (core.messaging.HALT_KEY) and
+then publishes a RiskOverride with requires_human_reset=True. Agents receiving the override
+set _trading_halted and stop. Docker's restart policy brings them back, and on startup they
+read the latch and stay halted. /control/resume deletes the latch; restart the agents to
+clear the in-memory halt.
 
-/control/test_order publishes a pre-approved RiskAssessment to risk.assessment.
-The ExecutionAgent (in its own container) picks it up, calls MT5Bridge.place_order(),
-and publishes an ExecutionResult. This endpoint waits up to 15 s for the result.
+The dashboard's nginx does not proxy /control, so these endpoints are reachable only on the
+API port itself, never through the public site.
+
+/control/test_order publishes a pre-approved RiskAssessment to risk.assessment. The
+ExecutionAgent picks it up, calls MT5Bridge.place_order(), and publishes an ExecutionResult.
+This endpoint waits up to 20 s for the result.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 from decimal import Decimal
+from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from core.config import get_settings
 from core.logging import get_logger
-from core.messaging import Channels
+from core.messaging import HALT_KEY, Channels
 from core.models.signals import AggregatedSignal, SignalDirection
 from core.models.system import RiskOverride, SystemCommand, SystemCommandMessage
 from core.models.trade import (
@@ -48,7 +55,26 @@ from core.models.trade import (
 
 logger = get_logger("api.control")
 
-router = APIRouter(prefix="/control", tags=["control"])
+
+def require_control_key(x_api_key: str | None = Header(default=None)) -> None:
+    """Reject the request unless X-API-Key matches the configured CONTROL_API_KEY."""
+    configured = get_settings().control_api_key
+    if configured is None or not configured.get_secret_value():
+        raise HTTPException(
+            status_code=403,
+            detail="Control plane disabled: set CONTROL_API_KEY to enable it.",
+        )
+    if x_api_key is None or not secrets.compare_digest(
+        x_api_key.encode(), configured.get_secret_value().encode()
+    ):
+        raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key header.")
+
+
+router = APIRouter(
+    prefix="/control",
+    tags=["control"],
+    dependencies=[Depends(require_control_key)],
+)
 
 
 class CommandRequest(BaseModel):
@@ -65,19 +91,22 @@ class HaltRequest(BaseModel):
     reason: str = "Manual halt via API"
 
 
+def _bus_or_503(request: Request) -> Any:
+    bus = getattr(request.app.state, "bus", None)
+    if bus is None:
+        raise HTTPException(status_code=503, detail="Message bus not available")
+    return bus
+
+
 @router.post("/command")
 async def post_command(body: CommandRequest, request: Request) -> dict:
     """
     Publish a SystemCommandMessage to the system.command channel.
 
     Agents that subscribe to this channel and match the target_agent (or
-    target_agent='all') will act on the command. Agents that do not currently
-    subscribe to system.command will not receive it.
+    target_agent='all') will act on the command.
     """
-    bus = getattr(request.app.state, "bus", None)
-    if bus is None:
-        raise HTTPException(status_code=503, detail="Message bus not available")
-
+    bus = _bus_or_503(request)
     msg = SystemCommandMessage(
         command=body.command,
         target_agent=body.target_agent,
@@ -101,34 +130,48 @@ async def post_command(body: CommandRequest, request: Request) -> dict:
 @router.post("/halt")
 async def post_halt(body: HaltRequest, request: Request) -> dict:
     """
-    Trigger an emergency trading halt by publishing a RiskOverride.
+    Emergency stop: persist the halt latch, then publish a RiskOverride.
 
-    All agents inherit a _risk_override_listener that sets _trading_halted=True
-    on receipt. When requires_human_reset=True (always the case here), agents
-    also call their own stop() — requiring manual restart to resume.
-
-    This endpoint is the operator's emergency stop button.
+    The latch is written first so any agent that restarts after receiving the override
+    comes back halted.
     """
-    bus = getattr(request.app.state, "bus", None)
-    if bus is None:
-        raise HTTPException(status_code=503, detail="Message bus not available")
-
+    bus = _bus_or_503(request)
     override = RiskOverride(
         reason=body.reason,
         triggered_by="api:halt",
         requires_human_reset=True,
     )
     try:
+        await bus.kv_set(HALT_KEY, body.reason)
         count = await bus.publish(override)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Publish failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Halt failed: {exc}") from exc
 
+    logger.critical("manual_halt_issued", reason=body.reason)
     return {
         "ok": True,
         "override_id": str(override.override_id),
         "reason": body.reason,
         "requires_human_reset": True,
+        "halt_latch_set": True,
         "subscribers_notified": count,
+    }
+
+
+@router.post("/resume")
+async def post_resume(request: Request) -> dict:
+    """Clear the halt latch. Restart the stopped agents to resume trading."""
+    bus = _bus_or_503(request)
+    try:
+        await bus.cache_delete(HALT_KEY)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Resume failed: {exc}") from exc
+
+    logger.warning("halt_latch_cleared")
+    return {
+        "ok": True,
+        "halt_latch_cleared": True,
+        "next_step": "Restart the agents (docker compose restart) to clear the in-memory halt.",
     }
 
 
@@ -137,10 +180,9 @@ async def post_test_order(request: Request) -> dict:
     """
     Inject a minimal BUY order through the full MT5 execution stack.
 
-    Builds a pre-approved RiskAssessment and publishes it to risk.assessment.
-    The ExecutionAgent (running in its own container) picks it up, calls
-    MT5Bridge.place_order(), and publishes an ExecutionResult back to Redis.
-    This endpoint waits up to 15 seconds for the matching result and returns it.
+    Builds a pre-approved RiskAssessment and publishes it to risk.assessment. The
+    ExecutionAgent picks it up, calls MT5Bridge.place_order(), and publishes an
+    ExecutionResult back to Redis. This endpoint waits up to 20 seconds for it.
 
     Only available when EXECUTION_BROKER=mt5. Returns 400 otherwise.
     """
@@ -199,7 +241,6 @@ async def post_test_order(request: Request) -> dict:
     try:
         await bus.publish(assessment)
 
-        # Poll for the matching ExecutionResult (up to 20 s)
         loop = asyncio.get_event_loop()
         deadline = loop.time() + 20.0
         while loop.time() < deadline:

@@ -30,7 +30,14 @@ def upgrade() -> None:
     # ------------------------------------------------------------------
     # ohlcv_candles — may already exist when init.sql pre-created it
     # ------------------------------------------------------------------
+    # infrastructure/postgres/init.sql creates the same schema when the container is first
+    # created, so every table and index here is created only if it is missing.
     existing_tables = sa_inspect(op.get_bind()).get_table_names()
+
+    def create_table_if_missing(name: str, *elements: object) -> None:
+        if name not in existing_tables:
+            op.create_table(name, *elements)
+
     if "ohlcv_candles" not in existing_tables:
         op.create_table(
             "ohlcv_candles",
@@ -62,7 +69,7 @@ def upgrade() -> None:
     # ------------------------------------------------------------------
     # trade_proposals
     # ------------------------------------------------------------------
-    op.create_table(
+    create_table_if_missing(
         "trade_proposals",
         sa.Column(
             "proposal_id",
@@ -91,7 +98,7 @@ def upgrade() -> None:
     # ------------------------------------------------------------------
     # risk_assessments
     # ------------------------------------------------------------------
-    op.create_table(
+    create_table_if_missing(
         "risk_assessments",
         sa.Column(
             "assessment_id",
@@ -121,7 +128,7 @@ def upgrade() -> None:
     # ------------------------------------------------------------------
     # executions
     # ------------------------------------------------------------------
-    op.create_table(
+    create_table_if_missing(
         "executions",
         sa.Column(
             "result_id",
@@ -164,7 +171,7 @@ def upgrade() -> None:
     # ------------------------------------------------------------------
     # positions
     # ------------------------------------------------------------------
-    op.create_table(
+    create_table_if_missing(
         "positions",
         sa.Column(
             "position_id",
@@ -200,7 +207,7 @@ def upgrade() -> None:
     # ------------------------------------------------------------------
     # agent_heartbeats
     # ------------------------------------------------------------------
-    op.create_table(
+    create_table_if_missing(
         "agent_heartbeats",
         sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
         sa.Column("agent_name", sa.String(50), nullable=False),
@@ -220,12 +227,13 @@ def upgrade() -> None:
         "idx_heartbeats_agent",
         "agent_heartbeats",
         ["agent_name", "recorded_at"],
+        if_not_exists=True,
     )
 
     # ------------------------------------------------------------------
     # system_alerts
     # ------------------------------------------------------------------
-    op.create_table(
+    create_table_if_missing(
         "system_alerts",
         sa.Column(
             "alert_id",

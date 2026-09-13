@@ -44,44 +44,12 @@ RUN curl -fsSL -o /tmp/ta-lib.tar.gz \
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
+# Install exactly the pinned runtime dependencies from pyproject.toml, plus the real
+# TA-Lib wrapper (links against the C library built above). Only pyproject.toml is
+# copied here, so this layer is cached until the pins change, and the image can no
+# longer drift from the versions the tests run against.
 COPY pyproject.toml ./
-# TODO: replace with: RUN pip install --no-cache-dir -e .
-# For now install requirements directly
-RUN pip install --no-cache-dir \
-    # Core async framework
-    fastapi==0.115.0 \
-    uvicorn[standard]==0.30.6 \
-    # Settings and validation
-    pydantic==2.9.2 \
-    pydantic-settings==2.5.2 \
-    # Database
-    sqlalchemy[asyncio]==2.0.36 \
-    asyncpg==0.29.0 \
-    psycopg2-binary==2.9.9 \
-    alembic==1.13.3 \
-    # Redis
-    redis[hiredis]==5.1.1 \
-    # Exchange connectivity
-    ccxt==4.3.89 \
-    # Market data processing
-    pandas==2.2.3 \
-    numpy==1.26.4 \
-    # TA-Lib Python wrapper >=0.6.0 links against the 0.6.x C library
-    # we install in the layer above.
-    TA-Lib==0.6.4 \
-    # Logging
-    structlog==24.4.0 \
-    # Utilities
-    python-dotenv==1.0.1 \
-    httpx==0.27.2 \
-    aiohttp==3.10.10 \
-    tenacity==9.0.0 \
-    # Phase 6: metrics are first-class.
-    prometheus-client==0.21.1 \
-    # Phase 8: ML signal engine
-    xgboost>=2.0.0 \
-    scikit-learn>=1.4.0 \
-    joblib>=1.3.0
+RUN pip install --no-cache-dir ".[talib]"
 
 
 # ---------------------------------------------------------------------------

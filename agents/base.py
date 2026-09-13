@@ -14,7 +14,7 @@ Lifecycle:
     4. teardown()    — async cleanup (close connections, flush state)
 
 The supervisor script calls run_agent(MyAgent()) which manages this lifecycle
-and handles restarts after crashes, up to the configured crash limit.
+and restarts a fresh instance after crashes, up to the configured crash limit.
 
 Design decisions:
 - Abstract run_loop() forces every agent to implement its core logic.
@@ -44,12 +44,14 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import signal
+import sys
 import time
 from abc import ABC, abstractmethod
 
 from core.config import get_settings
 from core.logging import bind_agent_context, get_logger
-from core.messaging import MessageBus
+from core.messaging import HALT_KEY, MessageBus
 from core.metrics import AGENT_ERRORS, AGENT_UP, start_metrics_server
 from core.models.system import AgentHeartbeat, AgentStatus, RiskOverride
 
@@ -91,7 +93,7 @@ class BaseAgent(ABC):
         self.log = get_logger(self.name)
 
         # Messaging bus — initialised in setup()
-        self.bus: MessageBus = MessageBus()
+        self.bus: MessageBus = MessageBus(owner=self.name)
 
         # Lifecycle state
         self._status: AgentStatus = AgentStatus.STARTING
@@ -135,6 +137,7 @@ class BaseAgent(ABC):
                 self.log.debug("metrics_server_already_bound", error=str(exc))
 
         await self.bus.connect()
+        await self._load_halt_latch()
 
         await self.setup()
 
@@ -301,6 +304,22 @@ class BaseAgent(ABC):
             self._status = AgentStatus.QUARANTINED
             self._stop_event.set()
 
+    async def _load_halt_latch(self) -> None:
+        """
+        Honour a persisted trading halt (set by POST /control/halt or a Risk limit breach).
+
+        The latch lives in Redis so it survives restarts: Docker's restart policy brings a
+        stopped agent back, and without this check it would come back un-halted.
+        """
+        try:
+            reason = await self.bus.kv_get(HALT_KEY)
+        except Exception as e:
+            self.log.warning("halt_latch_read_failed", error=str(e))
+            return
+        if reason:
+            self._trading_halted = True
+            self.log.critical("trading_halt_latch_active", reason=reason)
+
     @property
     def uptime_seconds(self) -> float:
         return time.monotonic() - self._start_time
@@ -381,24 +400,30 @@ class BaseAgent(ABC):
 # ---------------------------------------------------------------------------
 
 
-async def run_agent(agent: BaseAgent) -> None:
+async def run_agent(agent: BaseAgent, install_signal_handlers: bool = False) -> None:
     """
     Run an agent with automatic restart on crash.
 
-    The supervisor pattern: if an agent's run() raises an exception,
-    we wait briefly and restart it — up to the configured crash limit.
-    After the limit, the agent is quarantined and the operator is alerted.
+    On a crash the supervisor waits (2 s, 4 s, ...) and starts a NEW instance of the same
+    class. Reusing the crashed instance would inherit its set stop event and exit at once.
+    After ``max_agent_crashes`` crashes it gives up and returns; in Docker the container's
+    restart policy is the second line of defence.
 
-    In production, this function runs inside a Docker container with
-    Docker's own restart policy as a second line of defence.
+    ``install_signal_handlers=True`` (used by each agent's ``__main__``) turns SIGTERM and
+    SIGINT into task cancellation, so ``stop()`` / ``teardown()`` run on ``docker stop``
+    instead of the process being SIGKILLed after the grace period. Leave it False when
+    several agents share one event loop (scripts/start.py installs its own handlers).
 
     Usage:
         if __name__ == "__main__":
-            asyncio.run(run_agent(MarketDataAgent()))
+            asyncio.run(run_agent(MarketDataAgent(), install_signal_handlers=True))
     """
     settings = get_settings()
     max_crashes = settings.risk.max_agent_crashes
     crash_count = 0
+
+    if install_signal_handlers:
+        _cancel_current_task_on_signal()
 
     while crash_count < max_crashes:
         try:
@@ -429,7 +454,16 @@ async def run_agent(agent: BaseAgent) -> None:
             wait = 2**crash_count
             logger.info("agent_restarting", agent=agent.name, wait_seconds=wait)
             await asyncio.sleep(wait)
+            agent = type(agent)()
 
-            # Re-instantiate to get a fresh state
-            # The supervisor must pass the class, not an instance, for this to work.
-            # TODO: Accept agent_class: Type[BaseAgent] and instantiate here
+
+def _cancel_current_task_on_signal() -> None:
+    """Cancel the running task on SIGTERM/SIGINT (POSIX only; a no-op on Windows)."""
+    if sys.platform == "win32":
+        return
+    task = asyncio.current_task()
+    if task is None:
+        return
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, task.cancel)

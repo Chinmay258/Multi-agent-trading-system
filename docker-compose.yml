@@ -27,6 +27,8 @@ x-agent-defaults: &agent-defaults
     redis:
       condition: service_healthy
   restart: unless-stopped
+  # tini as PID 1: forwards SIGTERM to the agent so `docker stop` shuts it down cleanly.
+  init: true
   logging:
     driver: json-file
     options:
@@ -61,7 +63,8 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
-      - "${DB_PORT:-5432}:5432"
+      # Bound to localhost: the database is never reachable from other machines.
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
     networks:
       - trading-net
     healthcheck:
@@ -80,14 +83,15 @@ services:
     command: >
       redis-server
       --maxmemory 512mb
-      --maxmemory-policy allkeys-lru
+      --maxmemory-policy volatile-lru
       --save 60 1
       --appendonly yes
       --appendfsync everysec
     volumes:
       - redis_data:/data
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      # Bound to localhost: Redis has no password, so it must never be exposed.
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     networks:
       - trading-net
     healthcheck:
@@ -127,8 +131,15 @@ services:
     command: python -m agents.technical_analysis.agent
     environment:
       AGENT_NAME: technical_analysis_agent
+    # Listing depends_on here replaces the anchor's mapping (YAML merge is shallow),
+    # so the infrastructure health gates are repeated.
     depends_on:
-      - market_data_agent
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      market_data_agent:
+        condition: service_started
 
   sentiment_agent:
     <<: *agent-defaults
@@ -145,8 +156,15 @@ services:
     command: python -m agents.decision.agent
     environment:
       AGENT_NAME: decision_agent
+    # Listing depends_on here replaces the anchor's mapping (YAML merge is shallow),
+    # so the infrastructure health gates are repeated.
     depends_on:
-      - technical_analysis_agent
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      technical_analysis_agent:
+        condition: service_started
 
   risk_agent:
     <<: *agent-defaults
@@ -154,8 +172,15 @@ services:
     command: python -m agents.risk.agent
     environment:
       AGENT_NAME: risk_agent
+    # Listing depends_on here replaces the anchor's mapping (YAML merge is shallow),
+    # so the infrastructure health gates are repeated.
     depends_on:
-      - decision_agent
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      decision_agent:
+        condition: service_started
 
   execution_agent:
     <<: *agent-defaults
@@ -165,8 +190,15 @@ services:
       AGENT_NAME: execution_agent
     ports:
       - "${MT5_LISTEN_PORT:-5556}:5556"   # MT5 WebRequest polling endpoint
+    # Listing depends_on here replaces the anchor's mapping (YAML merge is shallow),
+    # so the infrastructure health gates are repeated.
     depends_on:
-      - risk_agent
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      risk_agent:
+        condition: service_started
 
   monitoring_agent:
     <<: *agent-defaults
@@ -194,6 +226,7 @@ services:
       dockerfile: infrastructure/Dockerfile.agent
     container_name: trading_api
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    init: true
     env_file: .env
     ports:
       - "${API_PORT:-8000}:8000"
@@ -263,7 +296,8 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
     ports:
-      - "3000:3000"
+      # Host 3001: host 3000 is the dashboard.
+      - "3001:3000"
     networks:
       - trading-net
     profiles:

@@ -199,9 +199,14 @@ class ExecutionBroker(ABC):
     # Optional overrides (have sensible defaults, adapters may override)
     # ------------------------------------------------------------------
 
-    async def close_position(self, symbol: str) -> ExecutionResult | None:
+    async def close_position(
+        self, symbol: str, price: Decimal | None = None
+    ) -> ExecutionResult | None:
         """
         Close an open position for a symbol at market price.
+
+        ``price`` is the caller's latest market price. Simulated brokers fill at it;
+        real brokers ignore it and close at the venue's price.
 
         Default: places a market order in the opposite direction.
         MT5 adapter should override with native position close call.

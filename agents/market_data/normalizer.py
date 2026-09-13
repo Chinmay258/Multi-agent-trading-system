@@ -34,7 +34,7 @@ Usage:
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from core.logging import get_logger
 from core.models.market import OHLCVCandle
@@ -59,6 +59,24 @@ TIMEFRAME_SECONDS: dict[str, int] = {
 
 # How many timestamps to keep in dedup buffer per (symbol, timeframe)
 DEDUP_BUFFER_SIZE = 200
+
+
+def closed_candles(candles: list[OHLCVCandle], now: datetime | None = None) -> list[OHLCVCandle]:
+    """
+    Drop candles that are still forming.
+
+    Exchanges return the in-progress candle as the newest row of an OHLCV response.
+    Publishing it would feed indicators a partial bar, and because dedup downstream is by
+    timestamp, the candle's final values would never be delivered. A candle is closed once
+    ``open_time + timeframe <= now``. Candles with an unknown timeframe are kept.
+    """
+    now = now or datetime.now(UTC)
+    out: list[OHLCVCandle] = []
+    for candle in candles:
+        seconds = TIMEFRAME_SECONDS.get(candle.timeframe)
+        if seconds is None or candle.timestamp + timedelta(seconds=seconds) <= now:
+            out.append(candle)
+    return out
 
 
 class OHLCVNormaliser:

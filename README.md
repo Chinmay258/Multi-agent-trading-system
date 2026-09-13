@@ -15,7 +15,7 @@
 > See the [Disclaimer](DISCLAIMER.md).
 
 **🔴 Live demo:** **<https://multi-agent-trading.lovable.app>**
-*(runs on realistic animated demo data until the backend is deployed, then streams live)*
+*(streams live data while the backend is running; otherwise it shows bundled demo data)*
 
 ---
 
@@ -42,7 +42,8 @@ benchmarked against buy-and-hold and random entry. BTC/USDT, 1d, ~2 years, out-o
 | Buy & hold | −13.0% | +0.07 | — |
 | Random entry (mean of 200) | −0.21% | −0.32 | 29% |
 
-**No demonstrable edge:** the strategy is statistically indistinguishable from random entry,
+**No demonstrable edge:** the strategy beats only 153 of 200 random-entry runs (empirical
+p ≈ 0.24), which is statistically indistinguishable from random entry,
 and the ML classifier scores ~0.42 vs 0.33 random on a 3-class problem. We attempted a
 walk-forward ML strategy (Phase 5) — it **did not beat** the rule baseline out-of-sample, so
 we kept the simpler default and documented the negative result. Full detail:
@@ -165,6 +166,7 @@ Every variable is documented in [.env.example](.env.example). The most important
 | `EXECUTION_BROKER` | `paper` | `paper` or `mt5` (local terminal) |
 | `DATA_SOURCE` | `public` | `public` (keyless CCXT), `mt5` (local read-only), or `auto` |
 | `TA_USE_ML_SIGNALS` | `false` | rules (default; ML didn't beat it — see EVALUATION.md) |
+| `CONTROL_API_KEY` | unset | Enables `POST /control/*` (halt, resume), sent as `X-API-Key`. Unset = disabled |
 
 ---
 
