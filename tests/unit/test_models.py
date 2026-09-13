@@ -52,7 +52,7 @@ class TestOHLCVCandle:
 
     def test_channel_key_replaces_slash(self):
         candle = self._make_candle()
-        assert candle.channel_key == "market.ohlcv.BTC-USDT.1m"  # gitleaks:allow (channel name, not a secret)
+        assert candle.channel_key == "market.ohlcv.BTC-USDT.1m"  # gitleaks:allow
 
     def test_bullish_candle(self):
         candle = self._make_candle(open=Decimal("42000"), close=Decimal("42500"))
