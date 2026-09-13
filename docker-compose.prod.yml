@@ -7,7 +7,7 @@
 # What it changes vs. the base dev stack:
 #   - Adds a Caddy reverse proxy terminating TLS on :80/:443 in front of the
 #     dashboard (which itself proxies /api + /ws to the API).
-#   - Removes the dev debug host-port mappings (3000, 8000, 8081, 9090, 5556):
+#   - Removes the dev host-port mappings (3000, 8000, 8081, 9090, 5556, 5432, 6379):
 #     only 22/80/443 should ever be open on the VM (enforced by the cloud
 #     firewall too — see infra/). The agents talk over the internal network.
 #   - Adds conservative memory limits so a small VM doesn't OOM.
@@ -33,6 +33,14 @@ services:
       - trading-net
     depends_on:
       - dashboard
+
+  # Infrastructure stays on the internal network only. Published ports bypass the host
+  # firewall (Docker writes its own iptables rules), so they must not be published at all.
+  postgres:
+    ports: !reset []
+
+  redis:
+    ports: !reset []
 
   # Front door is Caddy now — drop the public debug port and cap memory.
   dashboard:
