@@ -314,6 +314,10 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8000)
     api_reload: bool = Field(default=False)
 
+    # Control-plane authentication. POST /control/* is disabled (HTTP 403) until this is
+    # set; callers must then send it in the X-API-Key header.
+    control_api_key: SecretStr | None = Field(default=None)
+
     # Paper trading starting balance
     paper_initial_balance_usd: float = Field(default=10_000.0)
 
