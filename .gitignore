@@ -23,7 +23,7 @@ env/
 .env
 
 # Trained ML models (binary artefacts; do not commit)
-models/
+/models/
 
 # Backtest: transient fetched-data cache (the committed sample lives in data/sample/).
 # Note: backtest/results/ IS committed (the evaluation report + metrics are deliverables).
