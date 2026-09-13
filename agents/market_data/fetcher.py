@@ -12,7 +12,8 @@ in the system talks to this class — never to CCXT directly. This means:
 Design decisions:
 - Async CCXT (ccxt.async_support) throughout — no blocking I/O.
 - Tenacity for retry logic with exponential backoff. Exchange APIs are
-  unreliable; every fetch must be retry-safe.
+  unreliable; every fetch must be retry-safe. Retries wrap the raw CCXT call,
+  before errors are translated into domain exceptions.
 - ExchangeFetcher is a context manager. Always use `async with` to ensure
   the underlying aiohttp session is properly closed.
 - Rate limiting is handled by CCXT internally (enableRateLimit=True), but
@@ -178,7 +179,6 @@ class ExchangeFetcher:
     # Public data fetching methods
     # ------------------------------------------------------------------
 
-    @retry(**RETRY_POLICY)
     async def fetch_ohlcv(
         self,
         symbol: str,
@@ -188,6 +188,9 @@ class ExchangeFetcher:
     ) -> list[OHLCVCandle]:
         """
         Fetch OHLCV candles for a symbol and timeframe.
+
+        Transient network errors are retried with exponential backoff (RETRY_POLICY) before
+        they are translated into domain exceptions.
 
         Args:
             symbol: Trading pair, e.g. "BTC/USDT"
@@ -199,19 +202,15 @@ class ExchangeFetcher:
             List of OHLCVCandle objects, oldest first.
 
         Raises:
-            ExchangeConnectionError: Cannot reach the exchange.
-            InsufficientDataError: Exchange returned fewer candles than needed.
+            ExchangeConnectionError: Cannot reach the exchange after retries.
+            ExchangeRateLimitError: Still rate-limited after retries.
+            InsufficientDataError: Exchange returned no candles.
         """
         self._assert_connected()
         self._assert_symbol_supported(symbol)
 
         try:
-            raw = await self._exchange.fetch_ohlcv(
-                symbol,
-                timeframe=timeframe,
-                limit=limit,
-                since=since_ms,
-            )
+            raw = await self._raw_fetch_ohlcv(symbol, timeframe, limit, since_ms)
         except ccxt.RateLimitExceeded as e:
             raise ExchangeRateLimitError(str(e)) from e
         except ccxt.BadSymbol as e:
@@ -238,14 +237,13 @@ class ExchangeFetcher:
         )
         return candles
 
-    @retry(**RETRY_POLICY)
     async def fetch_order_book(
         self,
         symbol: str,
         depth: int | None = None,
     ) -> OrderBook:
         """
-        Fetch L2 order book snapshot.
+        Fetch L2 order book snapshot (retried on transient network errors).
 
         Args:
             symbol: Trading pair, e.g. "BTC/USDT"
@@ -259,7 +257,7 @@ class ExchangeFetcher:
         depth = depth or self._settings.market_data.orderbook_depth
 
         try:
-            raw = await self._exchange.fetch_order_book(symbol, limit=depth)
+            raw = await self._raw_fetch_order_book(symbol, depth)
         except (ccxt.NetworkError, ccxt.RequestTimeout) as e:
             raise ExchangeConnectionError(str(e)) from e
 
@@ -273,10 +271,9 @@ class ExchangeFetcher:
         )
         return book
 
-    @retry(**RETRY_POLICY)
     async def fetch_ticker(self, symbol: str) -> Ticker:
         """
-        Fetch 24-hour rolling ticker.
+        Fetch 24-hour rolling ticker (retried on transient network errors).
 
         Args:
             symbol: Trading pair, e.g. "BTC/USDT"
@@ -288,7 +285,7 @@ class ExchangeFetcher:
         self._assert_symbol_supported(symbol)
 
         try:
-            raw = await self._exchange.fetch_ticker(symbol)
+            raw = await self._raw_fetch_ticker(symbol)
         except (ccxt.NetworkError, ccxt.RequestTimeout) as e:
             raise ExchangeConnectionError(str(e)) from e
 
@@ -301,11 +298,9 @@ class ExchangeFetcher:
         )
         return ticker
 
-    @retry(**RETRY_POLICY)
     async def fetch_balance(self) -> dict:
         """
         Fetch account balance. Requires API credentials.
-        Used by Risk agent to verify available funds.
 
         Returns:
             Raw CCXT balance dict (total, free, used per currency).
@@ -315,13 +310,44 @@ class ExchangeFetcher:
             raise ExchangeAuthError("fetch_balance requires API credentials")
 
         try:
-            balance = await self._exchange.fetch_balance()
-            logger.debug("balance_fetched", currencies=list(balance.get("total", {}).keys()))
-            return balance
+            balance = await self._raw_fetch_balance()
         except ccxt.AuthenticationError as e:
             raise ExchangeAuthError(str(e)) from e
         except (ccxt.NetworkError, ccxt.RequestTimeout) as e:
             raise ExchangeConnectionError(str(e)) from e
+
+        logger.debug("balance_fetched", currencies=list(balance.get("total", {}).keys()))
+        return balance
+
+    # ------------------------------------------------------------------
+    # Retried raw calls
+    # ------------------------------------------------------------------
+    # The retry decorator must wrap the call that raises the raw CCXT exception. The
+    # public methods above translate exceptions into domain errors, so decorating them
+    # directly would hide every retryable error from tenacity and nothing would retry.
+
+    @retry(**RETRY_POLICY)
+    async def _raw_fetch_ohlcv(
+        self, symbol: str, timeframe: str, limit: int, since_ms: int | None
+    ) -> list:
+        return await self._exchange.fetch_ohlcv(
+            symbol,
+            timeframe=timeframe,
+            limit=limit,
+            since=since_ms,
+        )
+
+    @retry(**RETRY_POLICY)
+    async def _raw_fetch_order_book(self, symbol: str, depth: int) -> dict:
+        return await self._exchange.fetch_order_book(symbol, limit=depth)
+
+    @retry(**RETRY_POLICY)
+    async def _raw_fetch_ticker(self, symbol: str) -> dict:
+        return await self._exchange.fetch_ticker(symbol)
+
+    @retry(**RETRY_POLICY)
+    async def _raw_fetch_balance(self) -> dict:
+        return await self._exchange.fetch_balance()
 
     # ------------------------------------------------------------------
     # Symbol utilities

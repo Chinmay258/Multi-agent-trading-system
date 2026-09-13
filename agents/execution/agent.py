@@ -4,70 +4,78 @@ agents/execution/agent.py
 ExecutionAgent — the system's order execution layer.
 
 Subscribes to:
-    risk.assessment     — RiskAssessment from RiskAgent
+    risk.assessment         — RiskAssessment from RiskAgent
+    market.ticker.{symbol}  — last traded price, used by the stop-loss / take-profit monitor
 
 Publishes:
-    execution.result    — ExecutionResult after each fill attempt
+    execution.result        — ExecutionResult after each fill attempt. Failed orders are
+                              published too (status=rejected) so Risk releases the size it
+                              reserved.
 
 Architecture rules:
     - Only imports from core/ and own package (agents.execution.*)
-    - Broker is selected from config — ExecutionAgent never names PaperBroker directly
-      in its logic; it talks only to the ExecutionBroker interface
+    - The broker is chosen from config; the run loop talks only to the ExecutionBroker
+      interface
     - All orders are gated by assessment.is_approved AND not self._trading_halted
-    - RiskOverride handling: inherited from BaseAgent. Sets _trading_halted = True
-      and (when requires_human_reset=True) calls stop(). The run_loop checks
-      _trading_halted at the top of every iteration to halt immediately.
-    - Portfolio state is cached to Redis after every fill so the FastAPI
-      control plane can read it without talking to the broker directly.
+    - Portfolio state is cached to Redis after every fill so the API can serve it without
+      talking to the broker.
 
-Redis cache keys written by this agent:
+Redis keys written by this agent:
     execution:balance       — JSON dict of BrokerBalance fields (TTL 300s)
     execution:positions     — JSON array of BrokerPosition fields (TTL 300s)
-    execution:history       — Redis list of ExecutionResult JSON (last 100 fills)
+    execution:history       — list of ExecutionResult JSON (last 100, trimmed atomically)
+
+Stop-loss / take-profit:
+    Paper mode has no exchange-side stops, so a monitor checks open positions every 30 s
+    against the latest ticker price and closes breaches at that price. The close is
+    published on execution.result like any other fill, so Risk's ledger stays in sync.
+    MT5 mode relies on the terminal's native SL/TP and runs the monitor as a 5 s safety net.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from decimal import Decimal
 
 from agents.base import BaseAgent, run_agent
 from agents.execution.broker_interface import BrokerPosition, ExecutionBroker
 from core.messaging import Channels
-from core.models.trade import ExecutionResult, RiskAssessment
+from core.models.market import Ticker
+from core.models.trade import ExecutionResult, OrderStatus, RiskAssessment
 
 _BALANCE_KEY = "execution:balance"
 _POSITIONS_KEY = "execution:positions"
 _HISTORY_KEY = "execution:history"
 _HISTORY_MAX = 100
 _CACHE_TTL = 300  # seconds
-_MONITOR_INTERVAL_SECONDS = 5  # default; overridden by MT5_POSITION_MONITOR_INTERVAL_SECONDS
+_PAPER_MONITOR_INTERVAL_SECONDS = 30
+_DB_WRITE_TIMEOUT_S = 2.0
 
 
 class ExecutionAgent(BaseAgent):
     """
     Consumes approved RiskAssessments and routes them to the active broker.
 
-    The broker implementation (paper vs live vs MT5) is selected at construction
-    time based on TRADING_MODE config. The agent itself is broker-agnostic.
-
     Run loop:
         1. Subscribe to risk.assessment.
         2. For each assessment:
            a. Check _should_continue() → exit if stopping.
-           b. Check _trading_halted → skip if risk override received.
-           c. Skip rejected assessments silently (Risk agent already logged them).
-           d. Place order via broker → publish ExecutionResult → cache portfolio.
+           b. Check _trading_halted → skip if a halt is active.
+           c. Skip rejected assessments (Risk agent already logged them).
+           d. Place order via broker → publish ExecutionResult → cache portfolio → audit row.
     """
 
     name = "execution_agent"
 
     def __init__(self) -> None:
         super().__init__()
-        # Broker is selected and instantiated in setup() — not here — so that
-        # the import only happens when the specific adapter is actually needed.
+        # Broker is selected and instantiated in setup() so the import only happens
+        # when the specific adapter is actually needed.
         self._broker: ExecutionBroker | None = None
         self._last_result: ExecutionResult | None = None
+        # Latest traded price per symbol, from market.ticker.* messages.
+        self._last_price: dict[str, Decimal] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -111,29 +119,22 @@ class ExecutionAgent(BaseAgent):
         """
         Subscribe to risk.assessment and execute approved orders.
 
-        In MT5 mode also starts a background position monitor that checks
-        open positions every MT5_POSITION_MONITOR_INTERVAL_SECONDS (default 5 s)
-        as a safety net backup to MT5's native SL/TP.
-
-        _trading_halted is checked at the top of each iteration — not only
-        before place_order — so the agent stops processing new assessments
-        immediately on RiskOverride, even if a message arrived concurrently.
+        Background tasks (a ticker listener and the stop-loss / take-profit monitor) are
+        owned by this loop and cancelled when it exits.
         """
         assert self._broker is not None, "setup() must complete before run_loop()"
 
-        # Start position monitor in MT5 mode
-        monitor_task: asyncio.Task | None = None
+        background: list[asyncio.Task] = [
+            asyncio.create_task(self._consume_tickers(), name="execution_ticker_listener")
+        ]
         if self.settings.execution_broker.lower() == "mt5":
-            monitor_task = asyncio.create_task(
-                self._position_monitor_loop(),
-                name="execution_position_monitor",
+            background.append(
+                asyncio.create_task(self._position_monitor_loop(), name="execution_mt5_monitor")
             )
-
-        # Start paper SL/TP monitor when using PaperBroker
-        from agents.execution.paper_broker import PaperBroker  # noqa: PLC0415
-
-        if isinstance(self._broker, PaperBroker):
-            asyncio.create_task(self._paper_position_monitor())
+        elif self._broker.capabilities.is_paper:
+            background.append(
+                asyncio.create_task(self._paper_position_monitor(), name="execution_paper_monitor")
+            )
 
         try:
             async for assessment in self.bus.subscribe(
@@ -143,7 +144,6 @@ class ExecutionAgent(BaseAgent):
                 if not self._should_continue():
                     break
 
-                # Immediate gate on risk override — do not even log the assessment
                 if self._trading_halted:
                     self.log.warning(
                         "skipping_assessment_trading_halted",
@@ -152,7 +152,6 @@ class ExecutionAgent(BaseAgent):
                     )
                     continue
 
-                # Skip rejected assessments — Risk agent already explained why
                 if not assessment.is_approved:
                     self.log.info(
                         "assessment_rejected_skipped",
@@ -164,53 +163,129 @@ class ExecutionAgent(BaseAgent):
                     self._record_success()
                     continue
 
-                # Execute approved order
                 try:
                     result = await self._broker.place_order(assessment)
-                    await self.bus.publish(result)
-                    await self._cache_portfolio_state()
-                    await self._append_history(result)
-                    self._last_result = result
-                    self._record_success()
-
-                    self.log.info(
-                        "order_executed",
-                        proposal_id=str(assessment.proposal_id),
-                        symbol=assessment.original_proposal.symbol,
-                        side=str(assessment.original_proposal.side),
-                        status=result.status,
-                        fill_price=float(result.average_fill_price or 0),
-                        fill_qty=float(result.filled_quantity),
-                        is_paper=result.is_paper,
-                    )
                 except Exception as exc:
                     self._handle_error(
                         exc,
                         context=f"place_order:{assessment.original_proposal.symbol}",
                     )
-        finally:
-            if monitor_task is not None:
-                monitor_task.cancel()
+                    await self._publish_failure(assessment, exc)
+                    continue
+
                 try:
-                    await monitor_task
-                except asyncio.CancelledError:
-                    pass
+                    await self._record_fill(result, persist=True)
+                    self._record_success()
+                except Exception as exc:
+                    self._handle_error(exc, context=f"record_fill:{result.symbol}")
+                    continue
+
+                self.log.info(
+                    "order_executed",
+                    proposal_id=str(assessment.proposal_id),
+                    symbol=assessment.original_proposal.symbol,
+                    side=str(result.side),
+                    status=result.status,
+                    fill_price=float(result.average_fill_price or 0),
+                    fill_qty=float(result.filled_quantity),
+                    realized_pnl_usd=(
+                        float(result.realized_pnl_usd)
+                        if result.realized_pnl_usd is not None
+                        else None
+                    ),
+                    is_paper=result.is_paper,
+                )
+        finally:
+            for task in background:
+                task.cancel()
+            await asyncio.gather(*background, return_exceptions=True)
+
+    async def _record_fill(self, result: ExecutionResult, persist: bool) -> None:
+        """Publish a fill, refresh the portfolio cache, append history, write the audit row."""
+        await self.bus.publish(result)
+        await self._cache_portfolio_state()
+        await self._append_history(result)
+        self._last_result = result
+        if persist:
+            await self._persist_execution(result)
+
+    async def _publish_failure(self, assessment: RiskAssessment, exc: Exception) -> None:
+        """Publish a rejected ExecutionResult so Risk releases the size it reserved."""
+        proposal = assessment.original_proposal
+        result = ExecutionResult(
+            proposal_id=assessment.proposal_id,
+            assessment_id=assessment.assessment_id,
+            symbol=proposal.symbol,
+            side=proposal.side,
+            order_type=proposal.order_type,
+            status=OrderStatus.REJECTED,
+            requested_quantity=Decimal("0"),
+            is_paper=self._broker.capabilities.is_paper if self._broker else True,
+            error_message=(str(exc) or type(exc).__name__)[:500],
+        )
+        try:
+            await self.bus.publish(result)
+            await self._append_history(result)
+        except Exception as publish_exc:
+            self.log.error("execution_failure_publish_failed", error=str(publish_exc))
 
     # ------------------------------------------------------------------
-    # Position monitor (MT5 mode)
+    # Prices
     # ------------------------------------------------------------------
+
+    async def _consume_tickers(self) -> None:
+        """Track the last traded price per symbol from market.ticker.* messages."""
+        channels = [Channels.ticker(symbol) for symbol in self.settings.market_data.symbols]
+        async for _channel, ticker in self.bus.subscribe_many(channels, Ticker):
+            if not self._should_continue():
+                break
+            if ticker.last > Decimal("0"):
+                self._last_price[ticker.symbol] = ticker.last
+
+    async def _current_price(self, symbol: str) -> Decimal | None:
+        """Latest ticker price; falls back to the most recent signal's price."""
+        price = self._last_price.get(symbol)
+        if price is not None:
+            return price
+        try:
+            raw = await self.bus.kv_get(f"signal:technical:{symbol.replace('/', '-')}:latest")
+        except Exception:
+            return None
+        if raw is None:
+            return None
+        try:
+            value = Decimal(str(json.loads(raw)["price"]))
+        except Exception:
+            return None
+        return value if value > Decimal("0") else None
+
+    # ------------------------------------------------------------------
+    # Stop-loss / take-profit monitors
+    # ------------------------------------------------------------------
+
+    async def _paper_position_monitor(self) -> None:
+        """Paper mode: close positions whose price crosses the SL/TP thresholds."""
+        assert self._broker is not None
+        sl_pct = self.settings.mt5.stop_loss_pct
+        tp_pct = self.settings.mt5.take_profit_pct
+
+        while self._should_continue():
+            await asyncio.sleep(_PAPER_MONITOR_INTERVAL_SECONDS)
+            try:
+                for pos in await self._broker.get_positions():
+                    price = await self._current_price(pos.symbol)
+                    if price is None:
+                        continue  # no price yet — check again next cycle
+                    await self._check_and_maybe_close(pos, sl_pct, tp_pct, price)
+            except Exception as exc:
+                self.log.error("paper_monitor_error", error=str(exc))
 
     async def _position_monitor_loop(self) -> None:
         """
-        Background task: safety-net monitor that closes positions on SL/TP breach.
+        MT5 mode: safety-net monitor behind the terminal's native SL/TP.
 
-        MT5's native SL/TP (set on the order at placement time) is the primary
-        mechanism and fires in milliseconds. This loop is a Python-side backup:
-        it runs every position_monitor_interval_seconds (default 5 s) and issues
-        a CLOSE_POSITION command if a breach is detected.
-
-        Current price comes from the MT5 heartbeat (pos.current_price, 1 Hz),
-        with the Redis signal cache as a fallback.
+        Current price comes from the MT5 heartbeat (pos.current_price, 1 Hz), falling back
+        to the ticker feed.
         """
         assert self._broker is not None
         sl_pct = self.settings.mt5.stop_loss_pct
@@ -225,21 +300,24 @@ class ExecutionAgent(BaseAgent):
 
         while self._should_continue():
             try:
-                await asyncio.sleep(self.settings.mt5.position_monitor_interval_seconds)
-
+                await asyncio.sleep(interval)
                 if not self._should_continue():
                     break
                 if self._trading_halted:
                     continue
 
                 positions = await asyncio.wait_for(self._broker.get_positions(), timeout=10.0)
-
                 for pos in positions:
+                    price = pos.current_price
+                    if price <= Decimal("0"):
+                        fallback = await self._current_price(pos.symbol)
+                        if fallback is None:
+                            continue
+                        price = fallback
                     await asyncio.wait_for(
-                        self._check_and_maybe_close(pos, sl_pct, tp_pct),
+                        self._check_and_maybe_close(pos, sl_pct, tp_pct, price),
                         timeout=15.0,
                     )
-
             except TimeoutError:
                 self.log.warning("position_monitor_timeout_skipping_cycle")
             except asyncio.CancelledError:
@@ -247,109 +325,23 @@ class ExecutionAgent(BaseAgent):
             except Exception as exc:
                 self.log.error("position_monitor_error", error=str(exc))
 
-    async def _paper_position_monitor(self) -> None:
-        """
-        Background task for paper mode: closes positions when SL or TP is breached.
-
-        Current price is read from Redis key
-        signal:technical:{symbol.replace("/","-")}:latest
-        (published by TechnicalAnalysisAgent). If that key is absent or expired
-        the position is skipped for this cycle — price will be checked again after
-        the next interval.
-        """
-        assert self._broker is not None
-        SL = self.settings.mt5.stop_loss_pct
-        TP = self.settings.mt5.take_profit_pct
-        interval = 30  # seconds
-
-        while self._should_continue():
-            await asyncio.sleep(interval)
-            try:
-                positions = await self._broker.get_positions()
-                for pos in positions:
-                    entry = float(pos.entry_price)
-                    if entry == 0:
-                        continue
-
-                    # Read current price from the TA agent's Redis signal cache
-                    current = 0.0
-                    if self.bus._pool is not None:  # noqa: SLF001
-                        cache_key = f"signal:technical:{pos.symbol.replace('/', '-')}:latest"
-                        raw = await self.bus._pool.get(cache_key)  # noqa: SLF001
-                        if raw is not None:
-                            try:
-                                signal_data = json.loads(raw)
-                                current = float(signal_data["price"])
-                            except Exception:
-                                pass
-
-                    if current == 0:
-                        continue  # no price available — skip this cycle
-
-                    if pos.side == "buy":
-                        pnl_pct = (current - entry) / entry
-                    else:
-                        pnl_pct = (entry - current) / entry
-
-                    if pnl_pct <= -SL:
-                        self.log.info(
-                            "paper_stop_loss_triggered",
-                            symbol=pos.symbol,
-                            pnl_pct=pnl_pct,
-                        )
-                        await self._broker.close_position(pos.symbol)
-
-                    elif pnl_pct >= TP:
-                        self.log.info(
-                            "paper_take_profit_triggered",
-                            symbol=pos.symbol,
-                            pnl_pct=pnl_pct,
-                        )
-                        await self._broker.close_position(pos.symbol)
-
-            except Exception as e:
-                self.log.error("paper_monitor_error", error=str(e))
-
     async def _check_and_maybe_close(
         self,
         pos: BrokerPosition,
         sl_pct: float,
         tp_pct: float,
+        price: Decimal,
     ) -> None:
-        """Evaluate SL/TP for one position and close it if a threshold is breached."""
-        # Primary: use current_price from MT5 heartbeat (populated by get_positions()
-        # from _cached_state — the EA posts this at 1 Hz so it is always fresh).
-        current_price = float(pos.current_price)
-
-        # Fallback: Redis signal cache if the heartbeat price is missing.
-        if current_price <= 0 and self.bus._pool is not None:  # noqa: SLF001
-            cache_key = f"signal_cache.technical.{pos.symbol.replace('/', '-')}"
-            raw = await self.bus._pool.get(cache_key)  # noqa: SLF001
-            if raw is not None:
-                try:
-                    signal_data = json.loads(raw)
-                    current_price = float(signal_data["price"])
-                except Exception:
-                    pass
-
-        if current_price <= 0:
-            self.log.debug("position_monitor_no_price", symbol=pos.symbol)
-            return
-
-        self.log.debug(
-            "position_monitor_check",
-            symbol=pos.symbol,
-            current_price=current_price,
-        )
-
+        """Evaluate SL/TP for one position and close it at ``price`` if breached."""
         entry = float(pos.entry_price)
-        if entry <= 0 or current_price <= 0:
+        current = float(price)
+        if entry <= 0 or current <= 0:
             return
 
         if pos.side == "buy":
-            pnl_pct = (current_price - entry) / entry
+            pnl_pct = (current - entry) / entry
         else:
-            pnl_pct = (entry - current_price) / entry
+            pnl_pct = (entry - current) / entry
 
         if pnl_pct <= -sl_pct:
             reason = "stop_loss_triggered"
@@ -363,15 +355,15 @@ class ExecutionAgent(BaseAgent):
             symbol=pos.symbol,
             side=pos.side,
             entry_price=entry,
-            current_price=current_price,
+            current_price=current,
             pnl_pct=round(pnl_pct * 100, 3),
         )
 
-        result = await self._broker.close_position(pos.symbol)
+        assert self._broker is not None
+        result = await self._broker.close_position(pos.symbol, price=price)
         if result is not None:
-            await self.bus.publish(result)
-            await self._cache_portfolio_state()
-            await self._append_history(result)
+            # Synthetic ids: there is no proposal row to reference, so no audit row.
+            await self._record_fill(result, persist=False)
             self.log.info(
                 "position_closed",
                 symbol=pos.symbol,
@@ -381,19 +373,12 @@ class ExecutionAgent(BaseAgent):
             )
 
     # ------------------------------------------------------------------
-    # Portfolio caching
+    # Portfolio caching and audit
     # ------------------------------------------------------------------
 
     async def _cache_portfolio_state(self) -> None:
-        """
-        Write current balance and positions to Redis so the API can serve
-        them without calling the broker directly.
-
-        Uses _pool directly (same pattern as RiskAgent) since BrokerBalance
-        and BrokerPosition are dataclasses, not BaseMarketModel subclasses,
-        so bus.cache_set() cannot be used here.
-        """
-        if self.bus._pool is None:  # noqa: SLF001
+        """Write current balance and positions to Redis so the API can serve them."""
+        if self._broker is None or not self.bus.connected:
             return
         try:
             balance = await self._broker.get_balance()
@@ -423,33 +408,51 @@ class ExecutionAgent(BaseAgent):
                 ]
             )
 
-            await self.bus._pool.setex(_BALANCE_KEY, _CACHE_TTL, balance_json)  # noqa: SLF001
-            await self.bus._pool.setex(_POSITIONS_KEY, _CACHE_TTL, positions_json)  # noqa: SLF001
+            await self.bus.kv_set(_BALANCE_KEY, balance_json, ttl_seconds=_CACHE_TTL)
+            await self.bus.kv_set(_POSITIONS_KEY, positions_json, ttl_seconds=_CACHE_TTL)
         except Exception as exc:
             self.log.warning("portfolio_cache_write_failed", error=str(exc))
 
     async def _append_history(self, result: ExecutionResult) -> None:
-        """Prepend the latest ExecutionResult to the Redis history list (cap at 100)."""
-        if self.bus._pool is None:  # noqa: SLF001
+        """Prepend the result to the Redis history list, capped at 100, in one transaction."""
+        if not self.bus.connected:
             return
         try:
-            await self.bus._pool.lpush(_HISTORY_KEY, result.to_json())  # noqa: SLF001
-            await self.bus._pool.ltrim(_HISTORY_KEY, 0, _HISTORY_MAX - 1)  # noqa: SLF001
+            await self.bus.list_push_capped(_HISTORY_KEY, result.to_json(), _HISTORY_MAX)
         except Exception as exc:
             self.log.warning("history_append_failed", error=str(exc))
+
+    async def _persist_execution(self, result: ExecutionResult) -> None:
+        """Best-effort audit write of a risk-approved fill (bounded by a 2 s timeout)."""
+        try:
+            await asyncio.wait_for(self._write_execution(result), timeout=_DB_WRITE_TIMEOUT_S)
+        except Exception as exc:
+            self.log.warning(
+                "execution_persist_failed",
+                result_id=str(result.result_id),
+                error=str(exc) or type(exc).__name__,
+            )
+
+    async def _write_execution(self, result: ExecutionResult) -> None:
+        from core.db.connection import get_session
+        from core.db.repositories.trade_repo import TradeRepository
+
+        async with get_session() as session:
+            await TradeRepository(session).save_execution(result)
 
     # ------------------------------------------------------------------
     # Health reporting
     # ------------------------------------------------------------------
 
     def health_extra(self) -> dict:
-        """Expose broker balance and last fill for heartbeat monitoring."""
+        """Expose broker identity, halt state, and last fill for heartbeat monitoring."""
         if self._broker is None:
             return {"trading_halted": self._trading_halted}
         extra: dict = {
             "broker": self._broker.capabilities.broker_name,
             "is_paper": self._broker.capabilities.is_paper,
             "trading_halted": self._trading_halted,
+            "prices_tracked": len(self._last_price),
         }
         if self._last_result:
             extra["last_fill"] = {
@@ -467,4 +470,4 @@ class ExecutionAgent(BaseAgent):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    asyncio.run(run_agent(ExecutionAgent()))
+    asyncio.run(run_agent(ExecutionAgent(), install_signal_handlers=True))

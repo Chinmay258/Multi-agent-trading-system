@@ -243,6 +243,11 @@ class ExecutionResult(BaseMarketModel):
     fee_usd: Decimal | None = Field(default=None, description="Total fee paid in USD")
     fee_currency: str | None = None
 
+    # Realised PnL, net of entry and exit fees (closing fills only; None when opening)
+    realized_pnl_usd: Decimal | None = Field(
+        default=None, description="Net realised PnL in USD for a closing fill"
+    )
+
     # Stop loss and take profit order IDs (if placed)
     stop_loss_order_id: str | None = None
     take_profit_order_id: str | None = None

@@ -66,4 +66,4 @@ if __name__ == "__main__":
     from core.logging import configure_logging
 
     configure_logging()
-    asyncio.run(run_agent(SentimentAgent()))
+    asyncio.run(run_agent(SentimentAgent(), install_signal_handlers=True))
